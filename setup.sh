@@ -6,7 +6,8 @@ set -euo pipefail
 # .env, pulls the embedding model, and starts all services.
 #
 # Usage:
-#   ./setup.sh              # interactive, asks before overwriting .env
+#   ./setup.sh              # interactive, uses pre-built GHCR images
+#   ./setup.sh --dev        # build images locally instead of pulling from GHCR
 #   ./setup.sh --yes        # non-interactive, overwrites .env if present
 #   ./setup.sh --dry-run    # print what would happen, don't change anything
 # ────────────────────────────────────────────────────────────────────────────
@@ -23,10 +24,12 @@ NC='\033[0m'
 
 DRY_RUN=false
 YES=false
+DEV=false
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --yes|-y)  YES=true ;;
+        --dev)     DEV=true ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
     esac
 done
@@ -191,6 +194,12 @@ done
 header "Compose configuration"
 
 COMPOSE_FILES=(-f compose.yaml)
+if ! $DEV && [ -f compose.images.yaml ]; then
+    COMPOSE_FILES+=(-f compose.images.yaml)
+    ok "Using pre-built GHCR images (--dev to build locally)"
+elif $DEV; then
+    ok "Building images locally (--dev mode)"
+fi
 if $HAS_GPU && [ -f compose.gpu.yaml ]; then
     COMPOSE_FILES+=(-f compose.gpu.yaml)
     ok "GPU overlay active (compose.gpu.yaml)"

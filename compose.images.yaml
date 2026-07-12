@@ -1,0 +1,18 @@
+# Pre-built images overlay — merged by setup.sh for production deployments
+# Usage: docker compose -f compose.yaml -f compose.images.yaml [-f compose.gpu.yaml] up -d
+#
+# This replaces local build contexts with GHCR images.
+# Omit this file (or use compose.dev.yaml) for local development builds.
+
+services:
+  api:
+    build: !reset null
+    image: ghcr.io/porkmagus/self-hosted-library-api:latest
+
+  worker:
+    build: !reset null
+    image: ghcr.io/porkmagus/self-hosted-library-api:latest
+
+  web:
+    build: !reset null
+    image: ghcr.io/porkmagus/self-hosted-library-web:latest

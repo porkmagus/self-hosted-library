@@ -114,8 +114,21 @@ class IngestionJob(Base):
 
 
 def init_db() -> None:
-    """Create all tables. In production, use Alembic migrations."""
-    Base.metadata.create_all(bind=get_engine())
+    """Run Alembic migrations to create/upgrade all tables."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    api_dir = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=str(api_dir),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error("Alembic migration failed: %s", result.stderr)
+        raise RuntimeError(f"Alembic migration failed: {result.stderr}")
 
 
 def get_db() -> Generator[Session, None, None]:
