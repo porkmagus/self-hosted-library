@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from datetime import timedelta
 from typing import Any
+from urllib.parse import quote
 
 from minio import Minio
 from minio.error import S3Error
@@ -12,6 +13,14 @@ from minio.error import S3Error
 from api.config import settings
 
 _client: Minio | None = None
+
+
+def build_public_object_url(object_name: str) -> str:
+    """Build a browser-safe URL without persisting instance hostnames in indexes."""
+    base = settings.MINIO_PUBLIC_URL.rstrip("/")
+    bucket = quote(settings.MINIO_BUCKET, safe="")
+    key = quote(object_name, safe="/")
+    return f"{base}/{bucket}/{key}"
 
 
 def get_minio_client() -> Minio:

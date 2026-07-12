@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+import httpx
 from fastapi import APIRouter
 
 from api.config import settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/health")
@@ -18,9 +21,7 @@ async def health_check() -> dict[str, Any]:
     errors: list[str] = []
 
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             resp = await client.get(f"{settings.OLLAMA_URL}/api/tags")
             status["ollama"] = "ok" if resp.status_code == 200 else "degraded"
     except Exception:
@@ -28,9 +29,7 @@ async def health_check() -> dict[str, Any]:
         errors.append("Ollama unreachable")
 
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             resp = await client.get(f"{settings.QDRANT_URL}/collections")
             status["qdrant"] = "ok" if resp.status_code == 200 else "degraded"
     except Exception:
@@ -41,9 +40,11 @@ async def health_check() -> dict[str, Any]:
         import redis.asyncio as aioredis
 
         r = aioredis.from_url(settings.REDIS_URL)
-        await r.ping()
-        await r.close()
-        status["redis"] = "ok"
+        try:
+            await r.ping()
+            status["redis"] = "ok"
+        finally:
+            await r.close()
     except Exception:
         status["redis"] = "unreachable"
         errors.append("Redis unreachable")
@@ -51,9 +52,9 @@ async def health_check() -> dict[str, Any]:
     try:
         from sqlalchemy import text
 
-        from api.models import engine
+        from api.models import get_engine
 
-        with engine.connect() as conn:
+        with get_engine().connect() as conn:
             conn.execute(text("SELECT 1"))
         status["postgres"] = "ok"
     except Exception:

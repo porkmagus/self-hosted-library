@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -15,6 +16,18 @@ from api.services.search_utils import normalize_query
 
 logger = logging.getLogger(__name__)
 _client: Redis[str] | None = None
+
+_LRU_EVICT_SCRIPT = """
+local excess = redis.call('ZCARD', KEYS[1]) - tonumber(ARGV[1])
+if excess > 0 then
+    local oldest = redis.call('ZRANGE', KEYS[1], 0, excess - 1)
+    if #oldest > 0 then
+        redis.call('DEL', unpack(oldest))
+        redis.call('ZREM', KEYS[1], unpack(oldest))
+    end
+end
+return excess
+"""
 
 
 def _redis() -> Redis[str]:
@@ -57,20 +70,13 @@ def set_cached(key: str, value: dict[str, Any], ttl: int = 600) -> None:
         return
     try:
         client = _redis()
-        now = __import__("time").time()
+        now = time.time()
         pipe = client.pipeline()
         pipe.setex(key, ttl, serialized)
         pipe.zadd("search:lru", {key: now})
         pipe.zremrangebyscore("search:lru", 0, now - ttl)
         pipe.execute()
-        excess = client.zcard("search:lru") - 256
-        if excess > 0:
-            oldest = client.zrange("search:lru", 0, excess - 1)
-            cleanup = client.pipeline()
-            if oldest:
-                cleanup.delete(*oldest)
-                cleanup.zrem("search:lru", *oldest)
-            cleanup.execute()
+        client.eval(_LRU_EVICT_SCRIPT, 1, "search:lru", "256")  # type: ignore[no-untyped-call]
     except RedisError as exc:
         logger.warning("Could not cache search response: %s", exc)
 

@@ -32,29 +32,45 @@ def get_qdrant_client() -> QdrantClient:
 def init_collection() -> QdrantClient:
     client = get_qdrant_client()
     existing = {col.name for col in client.get_collections().collections}
+    is_new = settings.QDRANT_COLLECTION not in existing
 
-    if settings.QDRANT_COLLECTION not in existing:
+    if is_new:
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION,
             vectors_config=VectorParams(
                 size=settings.EMBED_DIMENSION, distance=Distance.COSINE
             ),
         )
-    info = client.get_collection(settings.QDRANT_COLLECTION)
-    schema = getattr(info, "payload_schema", {}) or {}
-    desired = {
-        "content": PayloadSchemaType.TEXT,
-        "book_id": PayloadSchemaType.KEYWORD,
-        "title": PayloadSchemaType.TEXT,
-    }
-    for field, field_schema in desired.items():
-        if field not in schema:
+
+    if is_new:
+        desired = {
+            "content": PayloadSchemaType.TEXT,
+            "book_id": PayloadSchemaType.KEYWORD,
+            "title": PayloadSchemaType.TEXT,
+        }
+        for field, field_schema in desired.items():
             client.create_payload_index(
                 collection_name=settings.QDRANT_COLLECTION,
                 field_name=field,
                 field_schema=field_schema,
                 wait=True,
             )
+    else:
+        info = client.get_collection(settings.QDRANT_COLLECTION)
+        schema = getattr(info, "payload_schema", {}) or {}
+        desired = {
+            "content": PayloadSchemaType.TEXT,
+            "book_id": PayloadSchemaType.KEYWORD,
+            "title": PayloadSchemaType.TEXT,
+        }
+        for field, field_schema in desired.items():
+            if field not in schema:
+                client.create_payload_index(
+                    collection_name=settings.QDRANT_COLLECTION,
+                    field_name=field,
+                    field_schema=field_schema,
+                    wait=True,
+                )
     return client
 
 

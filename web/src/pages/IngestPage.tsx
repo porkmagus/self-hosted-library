@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import type { IngestProgress } from "../types"
 import { C } from "../types"
 import { api } from "../lib/api"
+import { ingestProgressLabel } from "../lib/ingestPresentation"
 import { ErrorBanner, Skeleton } from "../components"
 
 export function IngestPage() {
@@ -36,10 +37,10 @@ export function IngestPage() {
     try {
       const data = await api.ingestProgress(tid)
       setProgress(data)
-      if (data.status === "completed" || data.status === "failed") {
+      if (data.status === "completed" || data.status === "completed_with_errors") {
         if (pollingRef.current) clearInterval(pollingRef.current)
         setBusy(false)
-        setStatus(data.status === "completed" ? "Done!" : `Failed: ${data.error || "unknown"}`)
+        setStatus(data.status === "completed" ? "Done!" : `Completed with ${data.failed} failed`)
       }
     } catch (e) {
       console.error(e)
@@ -71,7 +72,7 @@ export function IngestPage() {
     }
   }
 
-  const pct = typeof progress?.progress === "number" ? progress.progress : null
+  const pct = typeof progress?.progress_pct === "number" ? progress.progress_pct : null
 
   return (
     <div>
@@ -119,7 +120,7 @@ export function IngestPage() {
             <div>
               <div className="progress"><span style={{ width: `${pct}%` }} /></div>
               <div className="muted" style={{ marginTop: 10 }}>
-                {pct}% — {progress.current}/{progress.total} books
+                {ingestProgressLabel(progress)}
               </div>
             </div>
           )}
