@@ -4,59 +4,76 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy import func
 
 from api.config import settings
 from api.models import Book, get_db
-from api.tasks.celery_app import ingest_batch_task
+from api.services.path_svc import resolve_under
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
-@router.get("/ingest/status")
-async def get_ingest_status() -> dict[str, Any]:
-    """Aggregate ingestion progress from the books table — real numbers, not Celery task state."""
+def _summarize_counts(
+    counts: Mapping[str, int], qdrant_chunks: int
+) -> dict[str, Any]:
+    total = sum(counts.values())
+    indexed = counts.get("indexed", 0)
+    failed = counts.get("failed", 0)
+    in_progress = total - indexed - failed
+    progress_pct = round(indexed / total * 100, 1) if total else 0.0
+    if total == 0:
+        status = "idle"
+    elif in_progress:
+        status = "processing"
+    elif failed:
+        status = "completed_with_errors"
+    else:
+        status = "completed"
+    return {
+        "total_books": total,
+        "indexed": indexed,
+        "in_progress": in_progress,
+        "failed": failed,
+        "progress_pct": progress_pct,
+        "qdrant_chunks": qdrant_chunks,
+        "status": status,
+    }
+
+
+def _get_progress_snapshot() -> dict[str, Any]:
     db = next(iter(get_db()))
     try:
-        from sqlalchemy import func
-
         rows = db.query(Book.status, func.count(Book.id)).group_by(Book.status).all()
         counts = {row[0].value if row[0] else "none": row[1] for row in rows}
-
-        total = sum(counts.values())
-        indexed = counts.get("indexed", 0)
-        failed = counts.get("failed", 0)
-        in_progress = total - indexed - failed
-
-        pct = (indexed / total * 100) if total > 0 else 0
-
-        # Qdrant stats
-        from api.services.qdrant_svc import get_collection_stats
-
-        try:
-            qdrant_stats = get_collection_stats()
-        except Exception:
-            qdrant_stats = {}
-
-        return {
-            "total_books": total,
-            "indexed": indexed,
-            "in_progress": in_progress,
-            "failed": failed,
-            "progress_pct": round(pct, 1),
-            "qdrant_chunks": qdrant_stats.get("points_count", 0),
-        }
     finally:
         db.close()
 
+    try:
+        from api.services.qdrant_svc import get_collection_stats
+
+        chunks = int(get_collection_stats().get("points_count", 0) or 0)
+    except Exception as exc:
+        logger.warning("Unable to read Qdrant collection stats: %s", exc)
+        chunks = 0
+    return _summarize_counts(counts, chunks)
+
+
+@router.get("/ingest/status")
+def get_ingest_status() -> dict[str, Any]:
+    """Aggregate ingestion progress from the books table — real numbers, not Celery task state."""
+    return _get_progress_snapshot()
+
 
 @router.get("/books")
-async def list_books(
+def list_books(
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -107,7 +124,7 @@ async def list_books(
 
 
 @router.get("/books/{book_id}")
-async def get_book(book_id: str) -> dict[str, Any]:
+def get_book(book_id: str) -> dict[str, Any]:
     """Get details for a specific book by UUID."""
     db = next(iter(get_db()))
     try:
@@ -139,7 +156,7 @@ async def get_book(book_id: str) -> dict[str, Any]:
 
 
 @router.post("/ingest/local")
-async def ingest_local_books(
+def ingest_local_books(
     paths: list[str] | None = Query(None),
     scan_inbox: bool = True,
 ) -> dict[str, Any]:
@@ -148,10 +165,15 @@ async def ingest_local_books(
     If scan_inbox is true, scans the configured data directory's inbox.
     If paths is provided, only ingests those specific files.
     """
+    from api.tasks.celery_app import ingest_batch_task
+
     data_dir = Path(settings.DATA_DIR)
 
     if paths:
-        book_paths = [str(data_dir / p) for p in paths]
+        try:
+            book_paths = [str(resolve_under(data_dir, p)) for p in paths]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     elif scan_inbox:
         inbox = data_dir / "inbox"
         if not inbox.exists():
@@ -197,114 +219,43 @@ async def ingest_local_books(
 
 
 @router.get("/ingest/{task_id}/progress")
-async def get_ingest_progress(task_id: str) -> dict[str, Any]:
-    """Get ingestion progress — backed by the DB, not Celery task state."""
-    # Always return real aggregate numbers
-    db = next(iter(get_db()))
-    try:
-        from sqlalchemy import func
-
-        rows = db.query(Book.status, func.count(Book.id)).group_by(Book.status).all()
-        counts = {row[0].value if row[0] else "none": row[1] for row in rows}
-
-        total = sum(counts.values())
-        indexed = counts.get("indexed", 0)
-        failed = counts.get("failed", 0)
-        in_progress = total - indexed - failed
-
-        pct = (indexed / total * 100) if total > 0 else 0
-
-        from api.services.qdrant_svc import get_collection_stats
-
-        try:
-            qdrant_stats = get_collection_stats()
-        except Exception:
-            qdrant_stats = {}
-
-        return {
-            "task_id": task_id,
-            "status": "processing"
-            if in_progress
-            else (
-                "completed" if total > 0 and failed == 0 else "completed_with_errors"
-            ),
-            "progress": round(pct, 1),
-            "progress_pct": round(pct, 1),
-            "total_books": total,
-            "indexed": indexed,
-            "in_progress": in_progress,
-            "failed": failed,
-            "qdrant_chunks": qdrant_stats.get("points_count", 0),
-        }
-    finally:
-        db.close()
-
+def get_ingest_progress(task_id: str) -> dict[str, Any]:
+    """Get aggregate ingestion progress from durable database state."""
+    snapshot = _get_progress_snapshot()
+    return {
+        "task_id": task_id,
+        "progress": snapshot["progress_pct"],
+        **snapshot,
+    }
 
 @router.get("/ingest/{task_id}/sse")
 async def stream_ingest_progress(task_id: str) -> StreamingResponse:
     """Server-Sent Events stream for real-time ingestion progress — backed by DB."""
 
     async def event_stream() -> AsyncIterator[str]:
-        last_indexed = None
-        last_failed = None
+        last_fingerprint: tuple[Any, ...] | None = None
 
         while True:
-            db = next(iter(get_db()))
-            try:
-                from sqlalchemy import func
+            snapshot = await asyncio.to_thread(_get_progress_snapshot)
+            data = {
+                "task_id": task_id,
+                "progress": snapshot["progress_pct"],
+                **snapshot,
+            }
+            fingerprint = (
+                data["indexed"],
+                data["failed"],
+                data["in_progress"],
+                data["qdrant_chunks"],
+                data["status"],
+            )
+            if fingerprint != last_fingerprint:
+                last_fingerprint = fingerprint
+                yield f"data: {json.dumps(data)}\n\n"
 
-                rows = (
-                    db.query(Book.status, func.count(Book.id))
-                    .group_by(Book.status)
-                    .all()
-                )
-                counts = {row[0].value if row[0] else "none": row[1] for row in rows}
-
-                total = sum(counts.values())
-                indexed = counts.get("indexed", 0)
-                failed = counts.get("failed", 0)
-                in_progress = total - indexed - failed
-
-                pct = (indexed / total * 100) if total > 0 else 0
-
-                from api.services.qdrant_svc import get_collection_stats
-
-                try:
-                    qdrant_stats = get_collection_stats()
-                except Exception:
-                    qdrant_stats = {}
-
-                chunks = qdrant_stats.get("points_count", 0)
-
-                # Only emit if something changed
-                if indexed != last_indexed or failed != last_failed:
-                    last_indexed = indexed
-                    last_failed = failed
-
-                    data = {
-                        "task_id": task_id,
-                        "status": "processing"
-                        if in_progress
-                        else (
-                            "completed"
-                            if total > 0 and failed == 0
-                            else "completed_with_errors"
-                        ),
-                        "progress": round(pct, 1),
-                        "progress_pct": round(pct, 1),
-                        "total_books": total,
-                        "indexed": indexed,
-                        "in_progress": in_progress,
-                        "failed": failed,
-                        "qdrant_chunks": chunks,
-                    }
-                    yield f"data: {json.dumps(data)}\n\n"
-
-                    if in_progress == 0 and total > 0:
-                        yield f"event: done\ndata: {json.dumps(data)}\n\n"
-                        break
-            finally:
-                db.close()
+                if data["status"] in {"completed", "completed_with_errors"}:
+                    yield f"event: done\ndata: {json.dumps(data)}\n\n"
+                    break
 
             await asyncio.sleep(2)
 

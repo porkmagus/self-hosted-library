@@ -4,7 +4,7 @@
 # Memory limits sized for ~15Gi host (api/worker/ollama take most headroom)
 
 networks:
-  grimoire:
+  library:
     driver: bridge
 
 volumes:
@@ -26,6 +26,7 @@ x-api-env: &api-env
   OLLAMA_URL: ${OLLAMA_URL}
   QDRANT_URL: ${QDRANT_URL}
   QDRANT_COLLECTION: ${QDRANT_COLLECTION:-library_documents}
+  IMAGE_COLLECTION: ${IMAGE_COLLECTION:-library_images}
   EMBED_MODEL: ${EMBED_MODEL:-bge-large}
   EMBED_DIMENSION: ${EMBED_DIMENSION:-1024}
   MINIO_ENDPOINT: ${MINIO_ENDPOINT}
@@ -36,13 +37,13 @@ x-api-env: &api-env
   DATA_DIR: ${DATA_DIR:-/app/data}
   EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-512}
   EMBED_BATCH_DELAY: ${EMBED_BATCH_DELAY:-0.0}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
   PYTHONUNBUFFERED: "1"
   PYTHONDONTWRITEBYTECODE: "1"
 
 services:
   qdrant:
     image: qdrant/qdrant@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c
-    container_name: grimoire-qdrant
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -51,7 +52,7 @@ services:
           memory: 5G
         reservations:
           memory: 512M
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "127.0.0.1:6333:6333"
       - "127.0.0.1:6334:6334"
@@ -68,7 +69,6 @@ services:
 
   postgres:
     image: postgres@sha256:fd1e8d0274f13f5a03a2673a207b28e14823c2f2efc3ca4bb4197c8a9f841bdc
-    container_name: grimoire-postgres
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -77,14 +77,14 @@ services:
           memory: 1G
         reservations:
           memory: 64M
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-grimoire}
-      POSTGRES_USER: ${POSTGRES_USER:-grimoire}
+      POSTGRES_DB: ${POSTGRES_DB:-library}
+      POSTGRES_USER: ${POSTGRES_USER:-library}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
@@ -95,7 +95,6 @@ services:
 
   redis:
     image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
-    container_name: grimoire-redis
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -104,7 +103,7 @@ services:
           memory: 512M
         reservations:
           memory: 32M
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
@@ -119,7 +118,6 @@ services:
 
   minio:
     image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    container_name: grimoire-minio
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -128,7 +126,7 @@ services:
           memory: 1G
         reservations:
           memory: 128M
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -147,10 +145,9 @@ services:
 
   ollama:
     image: ollama/ollama@sha256:f1a705f2bd113fb8d15f85f7c217f0dc5f6bebda6b0cc42b82c3ad165ffcb9dc
-    container_name: grimoire-ollama
     restart: unless-stopped
     logging: *default-logging
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "127.0.0.1:11434:11434"
     volumes:
@@ -179,8 +176,7 @@ services:
     build:
       context: ./api
       dockerfile: Dockerfile
-    image: grimoire-api:local
-    container_name: grimoire-api
+    image: self-hosted-library-api:local
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -189,7 +185,7 @@ services:
           memory: 4G
         reservations:
           memory: 512M
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "127.0.0.1:8000:8000"
     env_file: [.env]
@@ -220,8 +216,7 @@ services:
     build:
       context: ./api
       dockerfile: Dockerfile
-    image: grimoire-api:local
-    container_name: grimoire-worker
+    image: self-hosted-library-api:local
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -230,7 +225,7 @@ services:
           memory: 5G
         reservations:
           memory: 512M
-    networks: [grimoire]
+    networks: [library]
     env_file: [.env]
     environment:
       <<: *api-env
@@ -260,8 +255,7 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-    image: grimoire-web:local
-    container_name: grimoire-web
+    image: self-hosted-library-web:local
     restart: unless-stopped
     logging: *default-logging
     deploy:
@@ -270,7 +264,7 @@ services:
           memory: 256M
         reservations:
           memory: 32M
-    networks: [grimoire]
+    networks: [library]
     ports:
       - "3000:3000"
     depends_on:

@@ -8,15 +8,11 @@ import os
 import uuid
 from typing import Any
 
-import fitz  # PyMuPDF
-import torch
-from PIL import Image
-from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
-from transformers import CLIPModel, CLIPProcessor
 
 from api.config import settings
-from api.services.minio_svc import get_minio_client
+from api.services.minio_svc import build_public_object_url, get_minio_client
+from api.services.qdrant_svc import get_qdrant_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +26,8 @@ def _load_clip() -> tuple[Any | None, Any | None]:
     if _CLIP_MODEL is not None:
         return _CLIP_MODEL, _CLIP_PROCESSOR
     try:
+        from transformers import CLIPModel, CLIPProcessor
+
         model_path = os.environ.get(
             "CLIP_MODEL_PATH", "/app/models/clip-vit-base-patch32"
         )
@@ -50,6 +48,9 @@ def get_image_embedding(image_bytes: bytes) -> list[float] | None:
     if model is None or processor is None:
         return None
     try:
+        import torch
+        from PIL import Image
+
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         inputs = processor(images=[img], return_tensors="pt")
         with torch.no_grad():
@@ -69,6 +70,8 @@ def get_text_embedding_for_search(query: str) -> list[float] | None:
     if model is None or processor is None:
         return None
     try:
+        import torch
+
         inputs = processor(text=[query], return_tensors="pt", padding=True)
         with torch.no_grad():
             text_output = model.text_model(**inputs)
@@ -83,8 +86,8 @@ def get_text_embedding_for_search(query: str) -> list[float] | None:
 
 def init_image_collection() -> None:
     """Initialize Qdrant image collection."""
-    client = QdrantClient(url=settings.QDRANT_URL)
-    collection_name = "grimoire_images"
+    client = get_qdrant_client()
+    collection_name = settings.IMAGE_COLLECTION
     collections = client.get_collections().collections
     if collection_name not in [c.name for c in collections]:
         client.create_collection(
@@ -97,7 +100,7 @@ def init_image_collection() -> None:
         client.create_payload_index(
             collection_name, "content_type", PayloadSchemaType.KEYWORD
         )
-        logger.info("Created grimoire_images collection")
+        logger.info("Created %s collection", collection_name)
 
 
 def extract_images_from_pdf(
@@ -105,6 +108,8 @@ def extract_images_from_pdf(
 ) -> list[dict[str, Any]]:
     """Extract images from a PDF."""
     try:
+        import fitz
+
         doc = fitz.open(pdf_path)
         extracted: list[dict[str, Any]] = []
         for page_num in range(len(doc)):
@@ -146,7 +151,7 @@ def index_image(image: dict[str, Any], embedding: list[float]) -> bool:
     """Index a single image in MinIO + Qdrant."""
     try:
         minio = get_minio_client()
-        qdrant = QdrantClient(url=settings.QDRANT_URL)
+        qdrant = get_qdrant_client()
 
         book_id = str(image["book_id"])
         book_title = str(image["book_title"])
@@ -165,7 +170,6 @@ def index_image(image: dict[str, Any], embedding: list[float]) -> bool:
             content_type=f"image/{ext}",
         )
 
-        public_base = settings.MINIO_PUBLIC_URL.rstrip("/")
         point = PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, image_id)),
             vector={"image": embedding},
@@ -174,13 +178,13 @@ def index_image(image: dict[str, Any], embedding: list[float]) -> bool:
                 "book_id": book_id,
                 "book_title": book_title,
                 "image_id": image_id,
-                "image_url": f"{public_base}/{settings.MINIO_BUCKET}/{filename}",
+                "minio_key": filename,
                 "page_number": int(image.get("page_number", 0) or 0),
                 "width": int(image.get("width", 0) or 0),
                 "height": int(image.get("height", 0) or 0),
             },
         )
-        qdrant.upsert(collection_name="grimoire_images", points=[point])
+        qdrant.upsert(collection_name=settings.IMAGE_COLLECTION, points=[point])
         return True
     except Exception as e:
         logger.error("Failed to index image: %s", e)
@@ -193,9 +197,9 @@ def search_images(query: str, limit: int = 10) -> list[dict[str, Any]]:
     if not text_embedding:
         return []
     try:
-        qdrant = QdrantClient(url=settings.QDRANT_URL)
+        qdrant = get_qdrant_client()
         results = qdrant.query_points(
-            collection_name="grimoire_images",
+            collection_name=settings.IMAGE_COLLECTION,
             query=text_embedding,
             using="image",
             limit=limit,
@@ -203,12 +207,18 @@ def search_images(query: str, limit: int = 10) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for r in results.points:
             payload = r.payload or {}
+            minio_key = str(payload.get("minio_key", "") or "")
+            image_url = (
+                build_public_object_url(minio_key)
+                if minio_key
+                else str(payload.get("image_url", "") or "")
+            )
             out.append(
                 {
                     "image_id": payload.get("image_id", ""),
                     "book_id": payload.get("book_id", ""),
                     "book_title": payload.get("book_title", ""),
-                    "image_url": payload.get("image_url", ""),
+                    "image_url": image_url,
                     "page_number": payload.get("page_number", 0),
                     "score": r.score,
                     "content_type": "image",

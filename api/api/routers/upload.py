@@ -6,10 +6,11 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from api.config import settings
 from api.services.minio_svc import ensure_bucket, get_presigned_upload_url
+from api.services.path_svc import validate_filename
 
 router = APIRouter()
 
@@ -17,6 +18,11 @@ router = APIRouter()
 class UploadRequest(BaseModel):
     filename: str
     content_type: str = "application/octet-stream"
+
+    @field_validator("filename")
+    @classmethod
+    def filename_must_be_plain(cls, value: str) -> str:
+        return validate_filename(value)
 
 
 class UploadResponse(BaseModel):
@@ -26,7 +32,7 @@ class UploadResponse(BaseModel):
 
 
 @router.post("/upload/presign")
-async def get_presigned_url(req: UploadRequest) -> UploadResponse:
+def get_presigned_url(req: UploadRequest) -> UploadResponse:
     """Get a presigned URL for direct browser upload to MinIO."""
     ensure_bucket()
 
@@ -45,12 +51,18 @@ async def get_presigned_url(req: UploadRequest) -> UploadResponse:
 
 
 @router.post("/upload/confirm")
-async def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
+def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
     """Called by the frontend after upload completes to trigger ingestion."""
 
     from api.models import Book, BookStatus, get_db
     from api.services.minio_svc import get_minio_client
     from api.tasks.celery_app import ingest_book_task
+
+    try:
+        filename = validate_filename(filename)
+        file_id = str(uuid.UUID(file_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Stat the file in MinIO to confirm it exists
     client = get_minio_client()

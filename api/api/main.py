@@ -6,10 +6,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.config import settings as app_settings
 from api.models import init_db
 from api.routers import (
     book_viewer,
-    books,
     context,
     health,
     ingest,
@@ -59,14 +59,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=app_settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
-app.include_router(books.router, prefix="/api", tags=["books"])
 app.include_router(upload.router, prefix="/api", tags=["upload"])
 app.include_router(search.router, prefix="/api", tags=["search"])
 app.include_router(context.router, prefix="/api", tags=["context"])

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,7 @@ from celery import Celery
 from sqlalchemy.orm import Session
 
 from api.config import settings
-from api.models import Book, BookStatus, get_db
+from api.models import Book, BookStatus, SessionLocal
 from api.services.image_svc import extract_images_from_pdf
 from api.services.minio_svc import upload_object
 from api.services.ollama_svc import (
@@ -35,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def make_celery() -> Celery:
-    app = Celery("grimoire")
+    app = Celery("self_hosted_library")
     app.conf.update(
         broker_url=settings.REDIS_URL,
         result_backend=settings.REDIS_URL,
@@ -57,7 +56,7 @@ celery_app = make_celery()
 
 def _get_db_session() -> Session:
     """Get a DB session for Celery tasks (outside FastAPI context)."""
-    return next(iter(get_db()))
+    return SessionLocal()
 
 
 @celery_app.task(bind=True, name="ingest.book")
@@ -107,17 +106,17 @@ def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
 
         # ── Step 1: Parse to text ──────────────────────────
         text = ""
-        output_dir = Path("/app/data/markdown")
+        output_dir = Path(settings.DATA_DIR) / "markdown"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if ext in (".pdf", ".PDF"):
+        if ext == ".pdf":
             md_path = convert_pdf_with_marker(book_path_obj, output_dir)
             if md_path and md_path.exists():
                 text = md_path.read_text(encoding="utf-8")
                 book.markdown_path = str(md_path)
             else:
                 text = extract_pdf_pymupdf(book_path_obj)
-        elif ext in (".epub",):
+        elif ext == ".epub":
             text = extract_epub(book_path_obj)
         elif ext in (".docx", ".doc"):
             text = extract_docx(book_path_obj)
@@ -132,13 +131,13 @@ def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
             )
 
         # ── Step 1b: Extract images from PDFs ───────────────
-        if ext in (".pdf", ".PDF"):
-            logger.info(f"Extracting images from {original_name}...")
+        if ext == ".pdf":
+            logger.info("Extracting images from %s", original_name)
             images = extract_images_from_pdf(
                 str(book_path_obj), book.uuid, book.title
             )
             if images:
-                logger.info(f"Found {len(images)} images in {original_name}")
+                logger.info("Found %d images in %s", len(images), original_name)
 
         book.status = BookStatus.CHUNKING
         db.commit()
@@ -204,7 +203,6 @@ def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
                 },
             )
 
-            time.sleep(0.1)
 
         # ── Step 5: Upload to MinIO ────────────────────────
         object_key = f"{sanitized}{ext}"
@@ -218,7 +216,7 @@ def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
             meta={"book_id": book_uuid, "status": "indexed", "progress": 100},
         )
 
-        print(f"Successfully indexed {original_name}: {total_indexed} chunks")
+        logger.info("Successfully indexed %s: %d chunks", original_name, total_indexed)
         return {
             "book_id": book_uuid,
             "indexed_chunks": total_indexed,
@@ -227,14 +225,15 @@ def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
 
     except Exception as e:
         error_msg = str(e)
-        print(f"Ingestion FAILED for {book_path}: {error_msg}")
+        logger.exception("Ingestion failed for %s", book_path)
+        db.rollback()
         try:
             if "book" in locals() and book is not None:
                 book.status = BookStatus.FAILED
                 book.error_message = error_msg[:2000]
                 db.commit()
         except Exception:
-            pass
+            logger.exception("Failed to persist ingestion failure for %s", book_path)
         raise
     finally:
         db.close()

@@ -1,19 +1,22 @@
 import { excerptText, normalizeDisplayText } from "./displayText"
+import { describe, expect, it } from "vitest"
 
-function assertEqual(actual: string, expected: string): void {
-  if (actual !== expected) throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
-}
+describe("display text", () => {
+  it("repairs character-per-line extraction without flattening structured text", () => {
+    expect(normalizeDisplayText("M\nA\nG\nI\nC\nI\nA\nN")).toBe("MAGICIAN")
+    expect(normalizeDisplayText("- salt\n- water")).toBe("- salt\n- water")
+    expect(normalizeDisplayText("Moon over water\nSilver in night\nQuiet ritual")).toBe(
+      "Moon over water\nSilver in night\nQuiet ritual",
+    )
+  })
 
-assertEqual(normalizeDisplayText("M\nA\nG\nI\nC\nI\nA\nN"), "MAGICIAN")
-assertEqual(normalizeDisplayText("- salt\n- water"), "- salt\n- water")
-assertEqual(normalizeDisplayText("Moon over water\nSilver in night\nQuiet ritual"), "Moon over water\nSilver in night\nQuiet ritual")
-
-const longExcerpt = "word ".repeat(180).trim()
-const collapsed = excerptText(longExcerpt, false, 120)
-const expanded = excerptText(longExcerpt, true, 120)
-if (!collapsed.canExpand || collapsed.text.length >= expanded.text.length || !collapsed.text.endsWith("…")) {
-  throw new Error("Collapsed excerpt must be visibly shorter and expandable")
-}
-if (expanded.text !== longExcerpt || !expanded.canExpand) {
-  throw new Error("Expanded excerpt must return the complete source text")
-}
+  it("returns a visibly shorter collapsed excerpt", () => {
+    const longExcerpt = "word ".repeat(180).trim()
+    const collapsed = excerptText(longExcerpt, false, 120)
+    const expanded = excerptText(longExcerpt, true, 120)
+    expect(collapsed.canExpand).toBe(true)
+    expect(collapsed.text.length).toBeLessThan(expanded.text.length)
+    expect(collapsed.text.endsWith("…")).toBe(true)
+    expect(expanded).toEqual({ text: longExcerpt, canExpand: true })
+  })
+})

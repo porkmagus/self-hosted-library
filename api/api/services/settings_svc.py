@@ -2,19 +2,15 @@
 
 from typing import Any
 
-from fastapi import HTTPException
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from api.config import get_settings
+from api.models import SessionLocal
 
 _app_settings: dict[str, str] | None = None
 
 
 def _get_session() -> Session:
-    s = get_settings()
-    engine = create_engine(s.DATABASE_URL, pool_pre_ping=True)
-    SessionLocal = sessionmaker(bind=engine)
     return SessionLocal()
 
 
@@ -67,9 +63,7 @@ def update_settings(updates: dict[str, Any]) -> dict[str, str]:
     global _app_settings
     for k in updates:
         if k not in ALLOWED_KEYS:
-            raise HTTPException(status_code=400, detail=f"Unknown setting: {k}")
-    if "accent_color" in updates and not updates["accent_color"].startswith("#"):
-        raise HTTPException(status_code=400, detail="accent_color must be a hex color")
+            raise ValueError(f"Unknown setting: {k}")
 
     session = _get_session()
     try:

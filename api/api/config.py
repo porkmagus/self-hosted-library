@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # Qdrant
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION: str = "library_documents"
+    IMAGE_COLLECTION: str = "library_images"
 
     # MinIO
     MINIO_ENDPOINT: str = "localhost:9000"
@@ -34,6 +35,12 @@ class Settings(BaseSettings):
     # Embedding batch config
     EMBED_BATCH_SIZE: int = 512
     EMBED_BATCH_DELAY: float = 0.0
+
+    CORS_ORIGINS: str = "http://localhost:3000"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

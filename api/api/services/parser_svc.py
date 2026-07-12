@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from api.services.search_utils import normalize_display_text
@@ -53,6 +54,35 @@ def extract_pdf_pymupdf(pdf_path: Path) -> str:
     return "\n\n".join(text_parts)
 
 
+def _build_marker_wrapper(
+    marker_src: Path, pdf_path: Path, output_dir: Path
+) -> str:
+    """Build the standalone Marker runner without shell interpolation."""
+    return (
+        "import os\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(marker_src)!r})\n"
+        "from marker.config.parser import ConfigParser\n"
+        "from marker.models import create_model_dict\n"
+        "from marker.output import save_output\n"
+        f"fpath = {str(pdf_path)!r}\n"
+        f"out_dir = {str(output_dir)!r}\n"
+        "models = create_model_dict()\n"
+        "config_parser = ConfigParser({})\n"
+        "converter_cls = config_parser.get_converter_cls()\n"
+        "converter = converter_cls(\n"
+        "    config=config_parser.generate_config_dict(),\n"
+        "    artifact_dict=models,\n"
+        "    processor_list=config_parser.get_processors(),\n"
+        "    renderer=config_parser.get_renderer(),\n"
+        "    llm_service=config_parser.get_llm_service(),\n"
+        ")\n"
+        "rendered = converter(fpath)\n"
+        "save_output(rendered, out_dir, os.path.splitext(os.path.basename(fpath))[0])\n"
+        "print('MARKER_SUCCESS')\n"
+    )
+
+
 def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
     """Convert PDF using Marker's Python API (NOT CLI - avoids exit code 0 false success).
 
@@ -71,34 +101,17 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
         )
         return None
 
-    # Build a standalone wrapper script to run in the marker poetry env
-    wrapper_content = (
-        "import sys\n"
-        "sys.path.insert(0, r'" + str(marker_src) + "')\n"
-        "from marker.config.parser import ConfigParser\n"
-        "from marker.models import create_model_dict\n"
-        "from marker.output import save_output\n"
-        "\n"
-        "fpath = r'" + str(pdf_path) + "'\n"
-        "out_dir = r'" + str(output_dir) + "'\n"
-        "\n"
-        "models = create_model_dict()\n"
-        "config_parser = ConfigParser({})\n"
-        "converter_cls = config_parser.get_converter_cls()\n"
-        "converter = converter_cls(\n"
-        "    config=config_parser.generate_config_dict(),\n"
-        "    artifact_dict=models,\n"
-        "    processor_list=config_parser.get_processors(),\n"
-        "    renderer=config_parser.get_renderer(),\n"
-        "    llm_service=config_parser.get_llm_service(),\n"
-        ")\n"
-        "rendered = converter(fpath)\n"
-        "save_output(rendered, out_dir, os.path.splitext(os.path.basename(fpath))[0])\n"
-        "print('MARKER_SUCCESS')\n"
-    )
-    wrapper_path = marker_src / "marker_worker_wrapper.py"
+    wrapper_content = _build_marker_wrapper(marker_src, pdf_path, output_dir)
     try:
-        wrapper_path.write_text(wrapper_content, encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="marker-worker-",
+            suffix=".py",
+            delete=False,
+        ) as wrapper:
+            wrapper.write(wrapper_content)
+            wrapper_path = Path(wrapper.name)
     except OSError as e:
         print(
             f"Cannot write Marker wrapper script: {e} — skipping Marker, using PyMuPDF fallback."
@@ -116,6 +129,8 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
     except subprocess.TimeoutExpired:
         print("Marker conversion timed out after 600s.")
         return None
+    finally:
+        wrapper_path.unlink(missing_ok=True)
 
     if result.returncode != 0 or "MARKER_SUCCESS" not in result.stdout:
         print(f"Marker failed: stdout={result.stdout} stderr={result.stderr}")

@@ -112,8 +112,13 @@ export interface AudioPlayerState {
 export interface IngestProgress {
   status: string
   progress: number
-  current: number
-  total: number
+  progress_pct: number
+  total_books: number
+  indexed: number
+  in_progress: number
+  failed: number
+  qdrant_chunks: number
+  task_id?: string
   error?: string
 }
 

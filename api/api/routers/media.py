@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from api.config import settings
+from api.services.path_svc import resolve_under
 
 router = APIRouter()
 
@@ -123,10 +124,11 @@ def list_media(
 def stream_media(
     path: str = Query(..., description="Relative path in data dir"),
 ) -> FileResponse:
-    base = Path(settings.DATA_DIR).resolve()
-    target = (base / path).resolve()
-    if not str(target).startswith(str(base)):
-        raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        target = resolve_under(settings.DATA_DIR, path)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     ext = target.suffix.lower()
