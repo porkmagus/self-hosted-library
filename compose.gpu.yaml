@@ -1,0 +1,12 @@
+# GPU acceleration overlay — merged with compose.yaml by setup.sh when NVIDIA GPU detected
+# Usage: docker compose -f compose.yaml -f compose.gpu.yaml up -d
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
