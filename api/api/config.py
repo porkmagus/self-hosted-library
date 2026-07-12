@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     EMBED_BATCH_SIZE: int = 512
     EMBED_BATCH_DELAY: float = 0.0
 
-    CORS_ORIGINS: str = "http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:8000"
 
     @property
     def cors_origins(self) -> list[str]:

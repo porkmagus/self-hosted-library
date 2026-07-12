@@ -117,6 +117,33 @@ export const api = {
       { method: "POST" },
     ),
 
+  searchHistory: (limit = 10, signal?: AbortSignal) =>
+    request<{ history: Array<{ query: string }>; total: number }>(
+      `/search/history?limit=${limit}`,
+      { signal },
+    ),
+
+  ingestBooks: (taskId: string) =>
+    request<{
+      task_id: string
+      active: Array<{
+        uuid: string
+        title: string
+        status: string
+        total_chunks: number
+        indexed_chunks: number
+        progress: number
+      }>
+      failed: Array<{ uuid: string; title: string; error_message: string }>
+      active_count: number
+      failed_count: number
+    }>(`/ingest/${taskId}/books`),
+
+  deleteBook: (bookId: string) =>
+    request<{ deleted: boolean; book_id: string }>(`/books/${bookId}`, {
+      method: "DELETE",
+    }),
+
   /** Direct PUT to MinIO presigned URL (not via API host). */
   putFile: async (uploadUrl: string, file: File, onProgress?: (pct: number) => void) => {
     await new Promise<void>((resolve, reject) => {

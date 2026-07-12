@@ -7,6 +7,7 @@ conversion. Handles EPUBs, DOCX, and plain text files.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from api.services.search_utils import normalize_display_text
 
+logger = logging.getLogger(__name__)
 
 # Filename sanitization
 def sanitize_filename(name: str) -> str:
@@ -90,14 +92,15 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
     """
     marker_src_value = os.environ.get("MARKER_SRC_DIR")
     if not marker_src_value:
-        print("MARKER_SRC_DIR is not configured — using PyMuPDF fallback.")
+        logger.info("MARKER_SRC_DIR is not configured — using PyMuPDF fallback.")
         return None
     marker_src = Path(marker_src_value)
 
     # Quick availability check — bail out so PyMuPDF fallback fires
     if not marker_src.is_dir():
-        print(
-            f"Marker source dir not found: {marker_src} — skipping Marker, using PyMuPDF fallback."
+        logger.info(
+            "Marker source dir not found: %s — skipping Marker, using PyMuPDF fallback.",
+            marker_src,
         )
         return None
 
@@ -113,8 +116,9 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
             wrapper.write(wrapper_content)
             wrapper_path = Path(wrapper.name)
     except OSError as e:
-        print(
-            f"Cannot write Marker wrapper script: {e} — skipping Marker, using PyMuPDF fallback."
+        logger.warning(
+            "Cannot write Marker wrapper script: %s — skipping Marker, using PyMuPDF fallback.",
+            e,
         )
         return None
 
@@ -127,13 +131,13 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
             cwd=str(marker_src),
         )
     except subprocess.TimeoutExpired:
-        print("Marker conversion timed out after 600s.")
+        logger.warning("Marker conversion timed out after 600s.")
         return None
     finally:
         wrapper_path.unlink(missing_ok=True)
 
     if result.returncode != 0 or "MARKER_SUCCESS" not in result.stdout:
-        print(f"Marker failed: stdout={result.stdout} stderr={result.stderr}")
+        logger.warning("Marker failed: stdout=%s stderr=%s", result.stdout, result.stderr)
         return None
 
     # Marker creates: output_dir/{stem}/{stem}.md

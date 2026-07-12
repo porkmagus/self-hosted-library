@@ -25,6 +25,7 @@ from api.services.search_cache import (
     release_flight,
     set_cached,
 )
+from api.services.search_history import get_history, record_query
 from api.services.search_utils import (
     diversify_results,
     normalize_display_text,
@@ -216,6 +217,7 @@ async def _search(req: SearchRequest, request: Request, response: Response) -> d
     response.headers["X-Search-Cache"] = "MISS"
     response.headers["Server-Timing"] = _timing_header(timings)
     logger.info("search query=%r results=%d timings=%s", query, payload["total"], timings)
+    await anyio.to_thread.run_sync(lambda: record_query(query, client_id))
     return payload
 
 
@@ -251,3 +253,17 @@ async def search_images_get(
     elapsed = (time.perf_counter() - started) * 1000
     response.headers["Server-Timing"] = f"images;dur={elapsed:.1f}"
     return {"query": normalize_query(q), "images": images, "image_count": len(images)}
+
+
+@router.get("/search/history")
+async def search_history(
+    limit: int = Query(10, ge=1, le=20),
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Get recent search queries."""
+    client_id = "default"
+    if request:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        client_id = forwarded or request.headers.get("x-real-ip") or (request.client.host if request.client else "default")
+    history = await anyio.to_thread.run_sync(lambda: get_history(client_id, limit))
+    return {"history": history, "total": len(history)}

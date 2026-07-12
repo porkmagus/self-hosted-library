@@ -1,8 +1,9 @@
-"""Ollama embedding service — TRUE batch embedding, no artificial delays."""
+"""Ollama embedding service — batch embedding with retry and exponential backoff."""
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, cast
 
 import httpx
@@ -27,28 +28,63 @@ def _get_client() -> httpx.Client:
 def pull_model_if_needed() -> None:
     """Ensure the embedding model is pulled in Ollama."""
     try:
-        with httpx.Client(timeout=httpx.Timeout(120.0)) as client:
-            resp = client.get(f"{settings.OLLAMA_URL}/api/tags")
-            if resp.status_code == 200:
-                models = resp.json().get("models", [])
-                model_names = [m["name"] for m in models]
-                if settings.EMBED_MODEL not in model_names:
-                    logger.info("Pulling Ollama model: %s", settings.EMBED_MODEL)
-                    pull_resp = client.post(
-                        f"{settings.OLLAMA_URL}/api/pull",
-                        json={"name": settings.EMBED_MODEL, "stream": False},
-                        timeout=600,
-                    )
-                    pull_resp.raise_for_status()
-                    logger.info("Model %s pulled successfully", settings.EMBED_MODEL)
-                else:
-                    logger.info("Model %s already available", settings.EMBED_MODEL)
+        client = _get_client()
+        resp = client.get(f"{settings.OLLAMA_URL}/api/tags")
+        if resp.status_code == 200:
+            models = resp.json().get("models", [])
+            model_names = [m["name"] for m in models]
+            if settings.EMBED_MODEL not in model_names:
+                logger.info("Pulling Ollama model: %s", settings.EMBED_MODEL)
+                pull_resp = client.post(
+                    f"{settings.OLLAMA_URL}/api/pull",
+                    json={"name": settings.EMBED_MODEL, "stream": False},
+                    timeout=600,
+                )
+                pull_resp.raise_for_status()
+                logger.info("Model %s pulled successfully", settings.EMBED_MODEL)
+            else:
+                logger.info("Model %s already available", settings.EMBED_MODEL)
     except Exception as e:
         logger.warning("Could not check/pull Ollama model: %s", e)
 
 
 def _sanitize(text: str) -> str:
     return "".join(ch for ch in text if ch.isprintable() or ch in _WS).strip()
+
+
+def _call_embed_with_retry(
+    client: httpx.Client,
+    payload: dict[str, Any],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+) -> httpx.Response | None:
+    """Call Ollama embed endpoint with exponential backoff retry."""
+    for attempt in range(max_retries):
+        try:
+            resp = client.post(
+                f"{settings.OLLAMA_URL}/api/embed",
+                json=payload,
+            )
+            if resp.status_code == 503 or (resp.status_code >= 500 and attempt < max_retries - 1):
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Ollama returned %d, retrying in %.1fs (attempt %d/%d)",
+                    resp.status_code, delay, attempt + 1, max_retries,
+                )
+                time.sleep(delay)
+                continue
+            return resp
+        except httpx.HTTPError as exc:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "Ollama request failed: %s, retrying in %.1fs (attempt %d/%d)",
+                    exc, delay, attempt + 1, max_retries,
+                )
+                time.sleep(delay)
+            else:
+                raise
+    return None
 
 
 def get_embedding_batch(texts: list[str]) -> list[list[float] | None]:
@@ -77,13 +113,16 @@ def get_embedding_batch(texts: list[str]) -> list[list[float] | None]:
         batch_indices = indices[start : start + 512]
 
         try:
-            resp = client.post(
-                f"{settings.OLLAMA_URL}/api/embed",
-                json={
-                    "model": settings.EMBED_MODEL,
-                    "input": batch,
-                },
-            )
+            resp = _call_embed_with_retry(client, {
+                "model": settings.EMBED_MODEL,
+                "input": batch,
+            })
+            if resp is None:
+                logger.warning("Embedding batch failed after retries, falling back to singles")
+                for idx in batch_indices:
+                    results[idx] = _single_embedding(texts[idx])
+                continue
+
             if resp.status_code == 400:
                 logger.warning(
                     "Batch of %d rejected (400), falling back to singles", len(batch)
@@ -123,10 +162,12 @@ def _single_embedding(text: str) -> list[float] | None:
 
     try:
         client = _get_client()
-        resp = client.post(
-            f"{settings.OLLAMA_URL}/api/embed",
-            json={"model": settings.EMBED_MODEL, "input": cleaned},
-        )
+        resp = _call_embed_with_retry(client, {
+            "model": settings.EMBED_MODEL,
+            "input": cleaned,
+        })
+        if resp is None:
+            return None
         if resp.status_code == 400:
             retry_text = cleaned[: max_chars // 4]
             if retry_text:

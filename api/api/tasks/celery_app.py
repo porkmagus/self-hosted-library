@@ -180,7 +180,7 @@ def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
                         book_id=book_uuid,
                         book_title=book.title,
                         source_key=original_name,
-                        page_number=batch_idx,
+                        page_number=batch_idx + 1,
                     )
                     total_indexed += upserted
 

@@ -1,4 +1,4 @@
-"""Books router — list, detail, and SSE progress streaming."""
+"""Books router — list, detail, delete, and SSE progress streaming."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 
 from api.config import settings
-from api.models import Book, get_db_session
+from api.models import Book, BookStatus, get_db_session
 from api.services.path_svc import resolve_under
 
 router = APIRouter()
@@ -147,52 +147,70 @@ def get_book(book_id: str) -> dict[str, Any]:
         }
 
 
-@router.post("/ingest/local")
-def ingest_local_books(
-    paths: list[str] | None = Query(None),
-    scan_inbox: bool = True,
-) -> dict[str, Any]:
-    """Trigger ingestion of local books from the data directory.
+@router.delete("/books/{book_id}")
+def delete_book(book_id: str) -> dict[str, Any]:
+    """Delete a book: remove from Qdrant, MinIO, filesystem, and database."""
+    from api.config import settings as cfg
+    from api.services.minio_svc import get_minio_client
+    from api.services.qdrant_svc import get_qdrant_client
 
-    If scan_inbox is true, scans the configured data directory's inbox.
-    If paths is provided, only ingests those specific files.
-    """
-    from api.tasks.celery_app import ingest_batch_task
+    with get_db_session() as db:
+        book = db.query(Book).filter(Book.uuid == book_id).first()
+        if not book:
+            raise HTTPException(status_code=404, detail="Book not found")
 
-    data_dir = Path(settings.DATA_DIR)
+        deleted_chunks = 0
+        deleted_minio = False
+        deleted_file = False
+        deleted_markdown = False
 
-    if paths:
+        # 1. Delete from Qdrant
         try:
-            book_paths = [str(resolve_under(data_dir, p)) for p in paths]
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    elif scan_inbox:
-        inbox = data_dir / "inbox"
-        if not inbox.exists():
-            raise HTTPException(
-                status_code=404, detail=f"Inbox directory not found: {inbox}"
+            qdrant = get_qdrant_client()
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            result = qdrant.delete(
+                collection_name=cfg.QDRANT_COLLECTION,
+                points_selector=Filter(
+                    must=[FieldCondition(key="book_id", match=MatchValue(value=book_id))]
+                ),
             )
+            deleted_chunks = getattr(result, "deleted", 0) or 0
+            logger.info("Deleted %d Qdrant points for book %s", deleted_chunks, book_id)
+        except Exception as exc:
+            logger.warning("Failed to delete Qdrant points for %s: %s", book_id, exc)
 
-        supported_exts = {
-            ".pdf", ".epub", ".mobi", ".docx", ".rtf", ".doc",
-            ".txt", ".md", ".htm", ".html",
+        # 2. Delete from MinIO
+        if book.minio_object_key:
+            try:
+                minio = get_minio_client()
+                minio.remove_object(cfg.MINIO_BUCKET, book.minio_object_key)
+                deleted_minio = True
+                logger.info("Deleted MinIO object %s for book %s", book.minio_object_key, book_id)
+            except Exception as exc:
+                logger.warning("Failed to delete MinIO object for %s: %s", book_id, exc)
+
+        # 3. Delete markdown file
+        if book.markdown_path:
+            md_path = Path(book.markdown_path)
+            if md_path.exists():
+                try:
+                    md_path.unlink()
+                    deleted_markdown = True
+                except Exception as exc:
+                    logger.warning("Failed to delete markdown %s: %s", md_path, exc)
+
+        # 4. Delete from database
+        db.delete(book)
+        db.commit()
+
+        return {
+            "deleted": True,
+            "book_id": book_id,
+            "qdrant_chunks": deleted_chunks,
+            "minio_deleted": deleted_minio,
+            "file_deleted": deleted_file,
+            "markdown_deleted": deleted_markdown,
         }
-        book_paths = [
-            str(f)
-            for f in inbox.rglob("*")
-            if f.is_file() and f.suffix.lower() in supported_exts
-        ]
-
-    if not book_paths:
-        return {"message": "No books to ingest", "count": 0}
-
-    task = ingest_batch_task.delay(book_paths)
-
-    return {
-        "task_id": task.id,
-        "book_count": len(book_paths),
-        "status": "queued",
-    }
 
 
 @router.get("/ingest/{task_id}/progress")
@@ -204,6 +222,48 @@ def get_ingest_progress(task_id: str) -> dict[str, Any]:
         "progress": snapshot["progress_pct"],
         **snapshot,
     }
+
+
+@router.get("/ingest/{task_id}/books")
+def get_ingest_books(task_id: str) -> dict[str, Any]:
+    """Get individual book ingestion status for live progress tracking."""
+    with get_db_session() as db:
+        books = db.query(Book).filter(
+            Book.status.in_([
+                BookStatus.EXTRACTING, BookStatus.CHUNKING,
+                BookStatus.EMBEDDING, BookStatus.PENDING,
+            ])
+        ).all()
+        active = [
+            {
+                "uuid": b.uuid,
+                "title": b.title,
+                "status": b.status.value if b.status else "unknown",
+                "total_chunks": b.total_chunks,
+                "indexed_chunks": b.indexed_chunks,
+                "progress": round(b.indexed_chunks / b.total_chunks * 100, 1) if b.total_chunks else 0,
+            }
+            for b in books
+        ]
+
+        failed = db.query(Book).filter(Book.status == BookStatus.FAILED).all()
+        failed_list = [
+            {
+                "uuid": b.uuid,
+                "title": b.title,
+                "error_message": b.error_message,
+            }
+            for b in failed
+        ]
+
+        return {
+            "task_id": task_id,
+            "active": active,
+            "failed": failed_list,
+            "active_count": len(active),
+            "failed_count": len(failed_list),
+        }
+
 
 @router.get("/ingest/{task_id}/sse")
 async def stream_ingest_progress(task_id: str) -> StreamingResponse:
@@ -245,3 +305,51 @@ async def stream_ingest_progress(task_id: str) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/ingest/local")
+def ingest_local_books(
+    paths: list[str] | None = Query(None),
+    scan_inbox: bool = True,
+) -> dict[str, Any]:
+    """Trigger ingestion of local books from the data directory.
+
+    If scan_inbox is true, scans the configured data directory's inbox.
+    If paths is provided, only ingests those specific files.
+    """
+    from api.tasks.celery_app import ingest_batch_task
+
+    data_dir = Path(settings.DATA_DIR)
+
+    if paths:
+        try:
+            book_paths = [str(resolve_under(data_dir, p)) for p in paths]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif scan_inbox:
+        inbox = data_dir / "inbox"
+        if not inbox.exists():
+            raise HTTPException(
+                status_code=404, detail=f"Inbox directory not found: {inbox}"
+            )
+
+        supported_exts = {
+            ".pdf", ".epub", ".docx", ".doc",
+            ".txt", ".md", ".htm", ".html",
+        }
+        book_paths = [
+            str(f)
+            for f in inbox.rglob("*")
+            if f.is_file() and f.suffix.lower() in supported_exts
+        ]
+
+    if not book_paths:
+        return {"message": "No books to ingest", "count": 0}
+
+    task = ingest_batch_task.delay(book_paths)
+
+    return {
+        "task_id": task.id,
+        "book_count": len(book_paths),
+        "status": "queued",
+    }

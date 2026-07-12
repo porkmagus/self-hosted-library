@@ -43,6 +43,8 @@ export function SearchPage() {
   const [pdfBook, setPdfBook] = useState<{ id: string; title: string } | null>(null)
   const [showMoreImages, setShowMoreImages] = useState(false)
   const [hasSearched, setHasSearched] = useState(Boolean(initialQ.trim()))
+  const [searchHistory, setSearchHistory] = useState<Array<{ query: string }>>([])
+  const [showHistory, setShowHistory] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const lastAuto = useRef("")
   const requestRef = useRef<AbortController | null>(null)
@@ -117,6 +119,12 @@ export function SearchPage() {
   }, [debouncedQ, doSearch])
 
   useEffect(() => () => requestRef.current?.abort(), [])
+
+  useEffect(() => {
+    if (showHistory && searchHistory.length === 0) {
+      void api.searchHistory(10).then(data => setSearchHistory(data.history || [])).catch(() => {})
+    }
+  }, [showHistory])
 
   useHotkeys({
     "/": (e) => {
@@ -231,19 +239,53 @@ export function SearchPage() {
           placeholder="Search titles, topics, authors…"
           value={query}
           onChange={e => setQuery(e.target.value)}
+          onFocus={() => { if (!query.trim()) setShowHistory(true) }}
+          onBlur={() => setTimeout(() => setShowHistory(false), 200)}
           onKeyDown={e => {
             if (e.key === "Enter") {
               lastAuto.current = query.trim()
               void doSearch(query)
+              setShowHistory(false)
             }
           }}
           aria-label="Search the library"
         />
-        <button type="button" className="btn" onClick={() => { lastAuto.current = query.trim(); void doSearch(query) }} disabled={!query.trim()}>
+        <button type="button" className="btn" onClick={() => { lastAuto.current = query.trim(); void doSearch(query); setShowHistory(false) }} disabled={!query.trim()}>
           {loading ? <Spinner size={14} /> : null}
           SEARCH
         </button>
       </div>
+
+      {showHistory && !query.trim() && searchHistory.length > 0 && (
+        <div style={{
+          background: C.card, border: `1px solid ${C.border}`, borderRadius: 8,
+          marginTop: 8, overflow: "hidden",
+        }}>
+          <div style={{ padding: "8px 14px", fontSize: 11, color: C.textMuted, letterSpacing: 0.08 }}>
+            RECENT SEARCHES
+          </div>
+          {searchHistory.map((h, i) => (
+            <button
+              key={i}
+              type="button"
+              style={{
+                display: "block", width: "100%", textAlign: "left", padding: "8px 14px",
+                background: "transparent", border: "none", cursor: "pointer",
+                color: C.text, fontSize: 14, borderBottom: `1px solid ${C.border}`,
+              }}
+              onMouseDown={e => {
+                e.preventDefault()
+                setQuery(h.query)
+                lastAuto.current = h.query
+                void doSearch(h.query)
+                setShowHistory(false)
+              }}
+            >
+              {h.query}
+            </button>
+          ))}
+        </div>
+      )}
 
       {error && <ErrorBanner message={error} onRetry={() => void doSearch(query)} />}
       {!loading && !error && !hasSearched && (
@@ -391,7 +433,7 @@ export function SearchPage() {
       })}
 
       {!loading && viewMode === "grid" && (
-        <div style={{ columnCount: 3, columnGap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 14 }}>
           {results.map(r => (
             <div key={r.chunk_id} className="card" style={{ breakInside: "avoid", marginBottom: 14, cursor: "pointer" }} onClick={() => toggleExpand(r)}>
               <div style={{ color: C.gold, fontSize: 13, marginBottom: 8, fontFamily: "var(--font-display)" }}>{r.book_title}</div>

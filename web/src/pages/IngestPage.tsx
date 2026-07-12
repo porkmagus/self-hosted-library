@@ -3,7 +3,22 @@ import type { IngestProgress } from "../types"
 import { C } from "../types"
 import { api } from "../lib/api"
 import { ingestProgressLabel } from "../lib/ingestPresentation"
-import { ErrorBanner, Skeleton } from "../components"
+import { ErrorBanner, Skeleton, Spinner } from "../components"
+
+interface ActiveBook {
+  uuid: string
+  title: string
+  status: string
+  total_chunks: number
+  indexed_chunks: number
+  progress: number
+}
+
+interface FailedBook {
+  uuid: string
+  title: string
+  error_message: string
+}
 
 export function IngestPage() {
   const [progress, setProgress] = useState<IngestProgress | null>(null)
@@ -12,7 +27,10 @@ export function IngestPage() {
   const [scanInbox, setScanInbox] = useState(true)
   const [busy, setBusy] = useState(false)
   const [loadingStatus, setLoadingStatus] = useState(true)
+  const [activeBooks, setActiveBooks] = useState<ActiveBook[]>([])
+  const [failedBooks, setFailedBooks] = useState<FailedBook[]>([])
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const booksPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const loadAggregate = useCallback(async () => {
     setLoadingStatus(true)
@@ -30,8 +48,19 @@ export function IngestPage() {
     void loadAggregate()
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current)
+      if (booksPollRef.current) clearInterval(booksPollRef.current)
     }
   }, [loadAggregate])
+
+  const pollBooks = async (tid: string) => {
+    try {
+      const data = await api.ingestBooks(tid)
+      setActiveBooks(data.active || [])
+      setFailedBooks(data.failed || [])
+    } catch (e) {
+      console.error(e)
+    }
+  }
 
   const poll = async (tid: string) => {
     try {
@@ -39,8 +68,10 @@ export function IngestPage() {
       setProgress(data)
       if (data.status === "completed" || data.status === "completed_with_errors") {
         if (pollingRef.current) clearInterval(pollingRef.current)
+        if (booksPollRef.current) clearInterval(booksPollRef.current)
         setBusy(false)
         setStatus(data.status === "completed" ? "Done!" : `Completed with ${data.failed} failed`)
+        void pollBooks(tid)
       }
     } catch (e) {
       console.error(e)
@@ -51,6 +82,8 @@ export function IngestPage() {
     setBusy(true)
     setError(null)
     setStatus("Scanning…")
+    setActiveBooks([])
+    setFailedBooks([])
     try {
       const data = await api.ingestLocal(scanInbox)
       const count = (data as { book_count?: number; count?: number }).book_count
@@ -60,7 +93,10 @@ export function IngestPage() {
       setStatus(count ? `Queued ${count} books` : "No books queued")
       if (taskId) {
         if (pollingRef.current) clearInterval(pollingRef.current)
+        if (booksPollRef.current) clearInterval(booksPollRef.current)
         pollingRef.current = setInterval(() => void poll(taskId), 2000)
+        booksPollRef.current = setInterval(() => void pollBooks(taskId), 3000)
+        void pollBooks(taskId)
       } else {
         setBusy(false)
         await loadAggregate()
@@ -78,7 +114,6 @@ export function IngestPage() {
     <div>
       <h2 className="page-title">INGEST</h2>
       {error && <ErrorBanner message={error} onRetry={() => void startIngest()} />}
-
       <label style={{
         display: "flex", alignItems: "center", gap: 10, color: C.textDim,
         marginBottom: 20, fontSize: 14, cursor: "pointer",
@@ -124,6 +159,51 @@ export function IngestPage() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {activeBooks.length > 0 && (
+        <div className="card" style={{ marginTop: 12 }}>
+          <div style={{ color: C.gold, fontSize: 13, marginBottom: 10, fontFamily: "var(--font-display)" }}>
+            ACTIVE BOOKS ({activeBooks.length})
+          </div>
+          {activeBooks.map(book => (
+            <div key={book.uuid} style={{
+              display: "flex", alignItems: "center", gap: 12, padding: "8px 0",
+              borderBottom: `1px solid ${C.border}`,
+            }}>
+              <Spinner size={12} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {book.title}
+                </div>
+                <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>
+                  {book.status} · {book.indexed_chunks}/{book.total_chunks} chunks
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: C.gold, minWidth: 40, textAlign: "right" }}>
+                {book.progress}%
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {failedBooks.length > 0 && (
+        <div className="card" style={{ marginTop: 12, borderColor: `${C.danger}40` }}>
+          <div style={{ color: C.danger, fontSize: 13, marginBottom: 10, fontFamily: "var(--font-display)" }}>
+            FAILED ({failedBooks.length})
+          </div>
+          {failedBooks.map(book => (
+            <div key={book.uuid} style={{
+              padding: "8px 0", borderBottom: `1px solid ${C.border}`,
+            }}>
+              <div style={{ fontSize: 13, color: C.text }}>{book.title}</div>
+              <div style={{ fontSize: 11, color: C.danger, marginTop: 2 }}>
+                {book.error_message?.slice(0, 120)}
+              </div>
+            </div>
+          ))}
         </div>
       )}
 
