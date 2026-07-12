@@ -1,0 +1,14 @@
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "E501",
+  "B008",
+]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"api/tasks/celery_app.py" = ["E402"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

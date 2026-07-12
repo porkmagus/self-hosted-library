@@ -1,0 +1,9 @@
+-r requirements.txt
+mypy>=1.11.0
+ruff>=0.6.0
+types-redis
+types-requests
+types-Pillow
+types-psycopg2
+
+pytest>=8.3.0

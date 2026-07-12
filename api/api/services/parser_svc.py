@@ -1,0 +1,250 @@
+"""Document parsing and chunking service.
+
+Uses PyMuPDF for fast PDF extraction and Marker Python API for layout-preserving
+conversion. Handles EPUBs, DOCX, and plain text files.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from api.services.search_utils import normalize_display_text
+
+
+# Filename sanitization
+def sanitize_filename(name: str) -> str:
+    """Clean up bibliographic filenames while preserving readability."""
+    name = re.sub(r" -- [a-f0-9]{32} -- .*Archive", "", name, flags=re.I)
+    name = re.sub(r" - libgen\.li", "", name, flags=re.I)
+    name = re.sub(r"\(BookFi\.org\)", "", name, flags=re.I)
+    name = name.replace("%3a", ":")
+    name = re.sub(r" -- [a-f0-9]{10,}", "", name, flags=re.I)
+    name = re.sub(r"[^a-zA-Z0-9\s\.\-\_]", "_", name)
+    name = re.sub(r"[\s\_]+", "_", name).strip("_")
+    return name[:150]
+
+
+def compute_file_hash(file_path: Path) -> str:
+    """SHA-256 hash of a file for deduplication."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# PDF Processing
+def extract_pdf_pymupdf(pdf_path: Path) -> str:
+    """Fast extraction using PyMuPDF. Good for text-heavy PDFs without complex layouts."""
+    import fitz
+
+    doc = fitz.open(str(pdf_path))
+    text_parts = []
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        text = page.get_text("text")
+        text_parts.append(text)
+    doc.close()
+    return "\n\n".join(text_parts)
+
+
+def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
+    """Convert PDF using Marker's Python API (NOT CLI - avoids exit code 0 false success).
+
+    Returns the path to the generated markdown file, or None on failure/unavailable.
+    """
+    marker_src_value = os.environ.get("MARKER_SRC_DIR")
+    if not marker_src_value:
+        print("MARKER_SRC_DIR is not configured — using PyMuPDF fallback.")
+        return None
+    marker_src = Path(marker_src_value)
+
+    # Quick availability check — bail out so PyMuPDF fallback fires
+    if not marker_src.is_dir():
+        print(
+            f"Marker source dir not found: {marker_src} — skipping Marker, using PyMuPDF fallback."
+        )
+        return None
+
+    # Build a standalone wrapper script to run in the marker poetry env
+    wrapper_content = (
+        "import sys\n"
+        "sys.path.insert(0, r'" + str(marker_src) + "')\n"
+        "from marker.config.parser import ConfigParser\n"
+        "from marker.models import create_model_dict\n"
+        "from marker.output import save_output\n"
+        "\n"
+        "fpath = r'" + str(pdf_path) + "'\n"
+        "out_dir = r'" + str(output_dir) + "'\n"
+        "\n"
+        "models = create_model_dict()\n"
+        "config_parser = ConfigParser({})\n"
+        "converter_cls = config_parser.get_converter_cls()\n"
+        "converter = converter_cls(\n"
+        "    config=config_parser.generate_config_dict(),\n"
+        "    artifact_dict=models,\n"
+        "    processor_list=config_parser.get_processors(),\n"
+        "    renderer=config_parser.get_renderer(),\n"
+        "    llm_service=config_parser.get_llm_service(),\n"
+        ")\n"
+        "rendered = converter(fpath)\n"
+        "save_output(rendered, out_dir, os.path.splitext(os.path.basename(fpath))[0])\n"
+        "print('MARKER_SUCCESS')\n"
+    )
+    wrapper_path = marker_src / "marker_worker_wrapper.py"
+    try:
+        wrapper_path.write_text(wrapper_content, encoding="utf-8")
+    except OSError as e:
+        print(
+            f"Cannot write Marker wrapper script: {e} — skipping Marker, using PyMuPDF fallback."
+        )
+        return None
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(wrapper_path)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(marker_src),
+        )
+    except subprocess.TimeoutExpired:
+        print("Marker conversion timed out after 600s.")
+        return None
+
+    if result.returncode != 0 or "MARKER_SUCCESS" not in result.stdout:
+        print(f"Marker failed: stdout={result.stdout} stderr={result.stderr}")
+        return None
+
+    # Marker creates: output_dir/{stem}/{stem}.md
+    stem = pdf_path.stem
+    marker_out = output_dir / stem / f"{stem}.md"
+    if marker_out.exists():
+        return marker_out
+
+    # Search for the generated file
+    found = list(output_dir.rglob(f"*{stem}*.md"))
+    if found:
+        return found[0]
+
+    return None
+
+
+# Other formats
+def extract_epub(epub_path: Path) -> str:
+    """Extract text from EPUB files."""
+    from ebooklib import epub as ebooklib_epub
+
+    book = ebooklib_epub.read_epub(str(epub_path))
+    text_parts = []
+    for item in book.get_items_of_type(ebooklib_epub.EBOOK_HTMLITEM):
+        content = item.get_content().decode("utf-8", errors="replace")
+        # Strip HTML tags for clean text
+        clean = re.sub(r"<[^>]+>", "", content)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        if clean:
+            text_parts.append(clean)
+    return "\n\n".join(text_parts)
+
+
+def extract_docx(docx_path: Path) -> str:
+    """Extract text from DOCX files."""
+    from docx import Document
+
+    doc = Document(str(docx_path))
+    return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def extract_text_file(text_path: Path) -> str:
+    """Read plain text, Markdown, HTML, etc."""
+    encodings = ["utf-8", "latin-1", "cp1252"]
+    for enc in encodings:
+        try:
+            return text_path.read_text(encoding=enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return text_path.read_bytes().decode("utf-8", errors="replace")
+
+
+# Semantic chunking
+def chunk_text_semantic(
+    text: str,
+    chunk_size: int = 1000,
+    overlap: int = 200,
+    respect_boundaries: bool = True,
+) -> list[str]:
+    """Recursive character text splitting with structural boundary awareness."""
+    if not text or not text.strip():
+        return []
+
+    text = normalize_display_text(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    if len(text) <= chunk_size:
+        return [text.strip()]
+
+    if respect_boundaries:
+        paragraphs = re.split(r"\n\s*\n", text)
+        chunks = []
+        current_chunk = ""
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            if len(current_chunk) + len(para) + 2 <= chunk_size:
+                if current_chunk:
+                    current_chunk += "\n\n" + para
+                else:
+                    current_chunk = para
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                if len(para) > chunk_size:
+                    sub_chunks = _split_at_sentences(para, chunk_size)
+                    chunks.extend(sub_chunks)
+                    current_chunk = ""
+                else:
+                    current_chunk = para
+
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+        if chunks:
+            return chunks
+
+    # Fallback: sliding window with overlap
+    chunks = []
+    step = chunk_size - overlap
+    for i in range(0, max(len(text), step), step):
+        chunk = text[i : i + chunk_size]
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        if i + chunk_size >= len(text):
+            break
+
+    return [c for c in chunks if len(c) > 50]
+
+
+def _split_at_sentences(text: str, max_size: int) -> list[str]:
+    """Split long text at sentence boundaries."""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    current = ""
+    for sent in sentences:
+        if len(current) + len(sent) + 1 <= max_size:
+            if current:
+                current += " " + sent
+            else:
+                current = sent
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = sent
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks if chunks else [text]
