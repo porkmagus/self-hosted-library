@@ -1,6 +1,6 @@
 # Self-Hosted Library
 
-A GPU-first, self-hosted document ingestion, semantic retrieval, and research system. One image, one compose file, one command to start.
+A GPU-first, self-hosted document ingestion, semantic retrieval, and research system. One image, one command to start.
 
 ## Quick start
 
@@ -61,25 +61,9 @@ Drop PDFs (or EPUBs, DOCXs, text files) into `data/inbox/` and click "Start Inge
 docker compose -f compose.yaml -f compose.gpu.yaml up -d
 ```
 
-## Development
-
-```bash
-# Backend
-cd api
-uv run --python 3.11 --with pytest --with redis --with pydantic-settings \
-  --with fastapi --with sqlalchemy --with celery --with minio \
-  --with psycopg2-binary --with qdrant-client pytest
-uvx ruff check api tests
-uv run --python 3.13 --with mypy mypy -p api --config-file mypy.ini
-
-# Frontend
-cd web
-npm test && npm run typecheck && npm run build
-```
-
 ## Deployment
 
-Pre-built images are published to `ghcr.io/porkmagus/self-hosted-library` on every tag. `setup.sh` uses them by default. To build locally:
+Pre-built images are published to `ghcr.io/porkmagus/self-hosted-library` on every tag. `setup.sh` uses them by default. To build locally instead:
 
 ```bash
 ./setup.sh --dev
@@ -96,6 +80,22 @@ docker compose up -d
 
 # With GPU
 docker compose -f compose.yaml -f compose.images.yaml -f compose.gpu.yaml up -d
+```
+
+## Development
+
+```bash
+# Backend
+cd api
+uv run --python 3.11 --with pytest --with redis --with pydantic-settings \
+  --with fastapi --with sqlalchemy --with celery --with minio \
+  --with psycopg2-binary --with qdrant-client pytest
+uvx ruff check api tests
+uv run --python 3.13 --with mypy mypy -p api --config-file mypy.ini
+
+# Frontend
+cd web
+npm test && npm run typecheck && npm run build
 ```
 
 ## Data safety
