@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, field_validator
 
 from api.config import settings
+from api.models import Book, BookStatus, get_db_session
 from api.services.minio_svc import ensure_bucket, get_presigned_upload_url
 from api.services.path_svc import validate_filename
 
@@ -36,11 +37,9 @@ def get_presigned_url(req: UploadRequest) -> UploadResponse:
     """Get a presigned URL for direct browser upload to MinIO."""
     ensure_bucket()
 
-    # Generate a unique object key
     file_id = str(uuid.uuid4())
     object_key = f"{file_id}_{req.filename}"
 
-    # Get presigned PUT URL (valid for 1 hour)
     upload_url = get_presigned_upload_url(object_key, expires_seconds=3600)
 
     return UploadResponse(
@@ -54,7 +53,6 @@ def get_presigned_url(req: UploadRequest) -> UploadResponse:
 def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
     """Called by the frontend after upload completes to trigger ingestion."""
 
-    from api.models import Book, BookStatus, get_db
     from api.services.minio_svc import get_minio_client
     from api.tasks.celery_app import ingest_book_task
 
@@ -64,7 +62,6 @@ def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Stat the file in MinIO to confirm it exists
     client = get_minio_client()
     object_key = f"{file_id}_{filename}"
     try:
@@ -74,9 +71,7 @@ def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
             status_code=404, detail=f"File {filename} not found in MinIO"
         ) from None
 
-    # Create a book record and queue ingestion
-    db = next(iter(get_db()))
-    try:
+    with get_db_session() as db:
         book_uuid = str(uuid.uuid4())
         book = Book(
             uuid=book_uuid,
@@ -92,8 +87,6 @@ def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
         db.add(book)
         db.commit()
 
-        # Queue Celery task for ingestion
-        # The worker will download from MinIO first
         task = ingest_book_task.delay(object_key)
 
         return {
@@ -101,5 +94,3 @@ def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
             "task_id": task.id,
             "status": "queued",
         }
-    finally:
-        db.close()

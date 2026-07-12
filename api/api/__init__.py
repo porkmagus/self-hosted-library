@@ -1,1 +1,1 @@
-"""Grimoire API package."""
+"""Self-Hosted Library API package."""

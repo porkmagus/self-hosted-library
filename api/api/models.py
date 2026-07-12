@@ -3,22 +3,51 @@
 from __future__ import annotations
 
 import enum
+import logging
 from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine
+from sqlalchemy import DateTime, Float, Integer, String, Text
 from sqlalchemy import Enum as SAEnum
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from api.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
     """Declarative base for all models."""
 
 
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+_engine: Engine | None = None
+SessionLocal: sessionmaker[Session] | None = None
+
+
+def get_engine() -> Engine:
+    global _engine, SessionLocal
+    if _engine is None:
+        _engine = __import__("sqlalchemy").create_engine(
+            settings.DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10
+        )
+        SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
+        logger.info("Database engine initialized")
+    return _engine
+
+
+@contextmanager
+def get_db_session() -> Generator[Session, None, None]:
+    """Context manager: yield a DB session, closing it on exit."""
+    if SessionLocal is None:
+        get_engine()
+    assert SessionLocal is not None
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 class BookStatus(str, enum.Enum):
@@ -86,13 +115,10 @@ class IngestionJob(Base):
 
 def init_db() -> None:
     """Create all tables. In production, use Alembic migrations."""
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=get_engine())
 
 
 def get_db() -> Generator[Session, None, None]:
     """Dependency: yield a DB session."""
-    db = SessionLocal()
-    try:
+    with get_db_session() as db:
         yield db
-    finally:
-        db.close()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter
@@ -12,6 +13,9 @@ from api.config import settings
 from api.services.qdrant_svc import get_qdrant_client
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+MAX_CONTEXT_POINTS = 200
 
 
 class ContextRequest(BaseModel):
@@ -60,7 +64,7 @@ async def _get_context(req: ContextRequest) -> dict[str, Any]:
         if pts:
             matched_chunk = pts[0]
     except Exception:
-        pass
+        logger.warning("Failed to retrieve chunk %s for book %s", req.chunk_id, req.book_id)
 
     page_min = max(0, req.page_number - req.pages_before)
     page_max = req.page_number + req.pages_after
@@ -70,18 +74,20 @@ async def _get_context(req: ContextRequest) -> dict[str, Any]:
     ]
     context_chunks: list[Any] = []
     offset: Any | None = None
-    while True:
+    while len(context_chunks) < MAX_CONTEXT_POINTS:
         pts, nxt = client.scroll(
             collection_name=settings.QDRANT_COLLECTION,
             scroll_filter=Filter(must=must),  # type: ignore[arg-type]
-            limit=100,
+            limit=min(100, MAX_CONTEXT_POINTS - len(context_chunks)),
             offset=offset,
             with_payload=True,
         )
         context_chunks.extend(pts)
-        if nxt is None or len(context_chunks) >= 50:
+        if nxt is None:
             break
         offset = nxt
+
+    truncated = len(context_chunks) >= MAX_CONTEXT_POINTS
 
     def _page_key(p: Any) -> tuple[int, int]:
         payload = p.payload or {}
@@ -130,4 +136,5 @@ async def _get_context(req: ContextRequest) -> dict[str, Any]:
         "page_count": len(pages),
         "total_points": int(getattr(total, "count", 0) or 0),
         "available_pages": sorted(pages.keys()),
+        "truncated": truncated,
     }

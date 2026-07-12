@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 
 from api.config import settings
-from api.models import Book, get_db
+from api.models import Book, get_db_session
 from api.services.path_svc import resolve_under
 
 router = APIRouter()
@@ -49,12 +49,9 @@ def _summarize_counts(
 
 
 def _get_progress_snapshot() -> dict[str, Any]:
-    db = next(iter(get_db()))
-    try:
+    with get_db_session() as db:
         rows = db.query(Book.status, func.count(Book.id)).group_by(Book.status).all()
         counts = {row[0].value if row[0] else "none": row[1] for row in rows}
-    finally:
-        db.close()
 
     try:
         from api.services.qdrant_svc import get_collection_stats
@@ -80,8 +77,7 @@ def list_books(
     search: str | None = Query(None),
 ) -> dict[str, Any]:
     """List all books in the library with optional filtering."""
-    db = next(iter(get_db()))
-    try:
+    with get_db_session() as db:
         q = db.query(Book)
 
         if status:
@@ -118,16 +114,14 @@ def list_books(
             "total": total,
             "limit": limit,
             "offset": offset,
+            "has_more": (offset + limit) < total,
         }
-    finally:
-        db.close()
 
 
 @router.get("/books/{book_id}")
 def get_book(book_id: str) -> dict[str, Any]:
     """Get details for a specific book by UUID."""
-    db = next(iter(get_db()))
-    try:
+    with get_db_session() as db:
         book = db.query(Book).filter(Book.uuid == book_id).first()
         if not book:
             raise HTTPException(status_code=404, detail="Book not found")
@@ -151,8 +145,6 @@ def get_book(book_id: str) -> dict[str, Any]:
             "created_at": book.created_at.isoformat() if book.created_at else None,
             "updated_at": book.updated_at.isoformat() if book.updated_at else None,
         }
-    finally:
-        db.close()
 
 
 @router.post("/ingest/local")
@@ -182,22 +174,8 @@ def ingest_local_books(
             )
 
         supported_exts = {
-            ".pdf",
-            ".epub",
-            ".mobi",
-            ".docx",
-            ".rtf",
-            ".doc",
-            ".txt",
-            ".md",
-            ".htm",
-            ".html",
-            ".PDF",
-            ".EPUB",
-            ".DOCX",
-            ".DOC",
-            ".TXT",
-            ".MD",
+            ".pdf", ".epub", ".mobi", ".docx", ".rtf", ".doc",
+            ".txt", ".md", ".htm", ".html",
         }
         book_paths = [
             str(f)
@@ -208,7 +186,6 @@ def ingest_local_books(
     if not book_paths:
         return {"message": "No books to ingest", "count": 0}
 
-    # Queue batch ingestion
     task = ingest_batch_task.delay(book_paths)
 
     return {

@@ -2,36 +2,49 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, cast
 
 import httpx
 
 from api.config import settings
 
+logger = logging.getLogger(__name__)
 _WS = "\n\r\t"
+_embed_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    global _embed_client
+    if _embed_client is None:
+        _embed_client = httpx.Client(
+            timeout=httpx.Timeout(300.0),
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=16),
+        )
+    return _embed_client
 
 
 def pull_model_if_needed() -> None:
     """Ensure the embedding model is pulled in Ollama."""
     try:
-        with httpx.Client(timeout=120) as client:
+        with httpx.Client(timeout=httpx.Timeout(120.0)) as client:
             resp = client.get(f"{settings.OLLAMA_URL}/api/tags")
             if resp.status_code == 200:
                 models = resp.json().get("models", [])
                 model_names = [m["name"] for m in models]
                 if settings.EMBED_MODEL not in model_names:
-                    print(f"Pulling Ollama model: {settings.EMBED_MODEL}")
+                    logger.info("Pulling Ollama model: %s", settings.EMBED_MODEL)
                     pull_resp = client.post(
                         f"{settings.OLLAMA_URL}/api/pull",
                         json={"name": settings.EMBED_MODEL, "stream": False},
                         timeout=600,
                     )
                     pull_resp.raise_for_status()
-                    print(f"Model {settings.EMBED_MODEL} pulled successfully.")
+                    logger.info("Model %s pulled successfully", settings.EMBED_MODEL)
                 else:
-                    print(f"Model {settings.EMBED_MODEL} already available.")
+                    logger.info("Model %s already available", settings.EMBED_MODEL)
     except Exception as e:
-        print(f"Warning: could not check/pull Ollama model: {e}")
+        logger.warning("Could not check/pull Ollama model: %s", e)
 
 
 def _sanitize(text: str) -> str:
@@ -57,39 +70,40 @@ def get_embedding_batch(texts: list[str]) -> list[list[float] | None]:
         return [None] * len(texts)
 
     results: list[list[float] | None] = [None] * len(texts)
+    client = _get_client()
 
     for start in range(0, len(clean), 512):
         batch = clean[start : start + 512]
         batch_indices = indices[start : start + 512]
 
         try:
-            with httpx.Client(timeout=300) as client:
-                resp = client.post(
-                    f"{settings.OLLAMA_URL}/api/embed",
-                    json={
-                        "model": settings.EMBED_MODEL,
-                        "input": batch,
-                    },
+            resp = client.post(
+                f"{settings.OLLAMA_URL}/api/embed",
+                json={
+                    "model": settings.EMBED_MODEL,
+                    "input": batch,
+                },
+            )
+            if resp.status_code == 400:
+                logger.warning(
+                    "Batch of %d rejected (400), falling back to singles", len(batch)
                 )
-                if resp.status_code == 400:
-                    print(
-                        f"Batch of {len(batch)} rejected (400), falling back to singles"
-                    )
-                    for idx in batch_indices:
-                        results[idx] = _single_embedding(texts[idx])
-                    continue
+                for idx in batch_indices:
+                    results[idx] = _single_embedding(texts[idx])
+                continue
 
-                resp.raise_for_status()
-                data = cast(dict[str, Any], resp.json())
-                embeddings = cast(list[Any], data.get("embeddings", []))
+            resp.raise_for_status()
+            data = cast(dict[str, Any], resp.json())
+            embeddings = cast(list[Any], data.get("embeddings", []))
 
-                for j, emb in enumerate(embeddings):
-                    if j < len(batch_indices):
-                        results[batch_indices[j]] = cast(list[float], emb)
+            for j, emb in enumerate(embeddings):
+                if j < len(batch_indices):
+                    results[batch_indices[j]] = cast(list[float], emb)
 
         except Exception as e:
-            print(
-                f"Batch embedding failed ({len(batch)} texts): {e}, falling back to singles"
+            logger.warning(
+                "Batch embedding failed (%d texts): %s, falling back to singles",
+                len(batch), e,
             )
             for idx in batch_indices:
                 results[idx] = _single_embedding(texts[idx])
@@ -108,24 +122,24 @@ def _single_embedding(text: str) -> list[float] | None:
         cleaned = cleaned[:max_chars].rsplit(" ", 1)[0]
 
     try:
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(
-                f"{settings.OLLAMA_URL}/api/embed",
-                json={"model": settings.EMBED_MODEL, "input": cleaned},
-            )
-            if resp.status_code == 400:
-                retry_text = cleaned[: max_chars // 4]
-                if retry_text:
-                    resp = client.post(
-                        f"{settings.OLLAMA_URL}/api/embed",
-                        json={"model": settings.EMBED_MODEL, "input": retry_text},
-                    )
-            resp.raise_for_status()
-            data = cast(dict[str, Any], resp.json())
-            embeddings = cast(list[Any], data.get("embeddings", []))
-            if embeddings:
-                return cast(list[float], embeddings[0])
-            return None
+        client = _get_client()
+        resp = client.post(
+            f"{settings.OLLAMA_URL}/api/embed",
+            json={"model": settings.EMBED_MODEL, "input": cleaned},
+        )
+        if resp.status_code == 400:
+            retry_text = cleaned[: max_chars // 4]
+            if retry_text:
+                resp = client.post(
+                    f"{settings.OLLAMA_URL}/api/embed",
+                    json={"model": settings.EMBED_MODEL, "input": retry_text},
+                )
+        resp.raise_for_status()
+        data = cast(dict[str, Any], resp.json())
+        embeddings = cast(list[Any], data.get("embeddings", []))
+        if embeddings:
+            return cast(list[float], embeddings[0])
+        return None
     except Exception:
         return None
 

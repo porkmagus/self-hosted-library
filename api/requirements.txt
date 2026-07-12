@@ -1,4 +1,4 @@
-# Grimoire API requirements
+# Self-Hosted Library API requirements
 
 # Core web framework
 fastapi==0.115.0

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from typing import Any
 from uuid import uuid4
 
@@ -36,7 +37,18 @@ logger = logging.getLogger(__name__)
 _embed_slots = asyncio.Semaphore(4)
 _rerank_slots = asyncio.Semaphore(2)
 _image_slots = asyncio.Semaphore(2)
-_flights: dict[str, asyncio.Lock] = {}
+_embed_client: httpx.AsyncClient | None = None
+_flight_events: dict[str, asyncio.Event] = {}
+
+
+def _get_embed_client() -> httpx.AsyncClient:
+    global _embed_client
+    if _embed_client is None:
+        _embed_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+        )
+    return _embed_client
 
 
 class SearchRequest(BaseModel):
@@ -103,7 +115,8 @@ async def _compute(req: SearchRequest, timings: dict[str, float]) -> dict[str, A
     query_vector: list[float] | None = None
     embed_started = time.perf_counter()
     try:
-        async with _embed_slots, httpx.AsyncClient(timeout=30) as client:
+        async with _embed_slots:
+            client = _get_embed_client()
             response = await client.post(
                 f"{settings.OLLAMA_URL}/api/embed",
                 json={"model": settings.EMBED_MODEL, "input": f"Represent this sentence for searching relevant passages: {query}"},
@@ -175,36 +188,34 @@ async def _search(req: SearchRequest, request: Request, response: Response) -> d
         response.headers["X-Search-Cache"] = "HIT"
         response.headers["Server-Timing"] = "cache;dur=0"
         return cached
-    lock = _flights.setdefault(key, asyncio.Lock())
-    async with lock:
+
+    event = _flight_events.setdefault(key, asyncio.Event())
+    token = uuid4().hex
+    owns_flight = await anyio.to_thread.run_sync(lambda: acquire_flight(key, token))
+    if not owns_flight:
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(event.wait(), timeout=30.0)
         cached = await anyio.to_thread.run_sync(lambda: get_cached(key))
         if cached is not None:
             response.headers["X-Search-Cache"] = "COALESCED"
             response.headers["Server-Timing"] = "cache;dur=0"
+            _flight_events.pop(key, None)
             return cached
-        token = uuid4().hex
         owns_flight = await anyio.to_thread.run_sync(lambda: acquire_flight(key, token))
-        if not owns_flight:
-            for _ in range(300):
-                await asyncio.sleep(0.1)
-                cached = await anyio.to_thread.run_sync(lambda: get_cached(key))
-                if cached is not None:
-                    response.headers["X-Search-Cache"] = "COALESCED"
-                    response.headers["Server-Timing"] = "cache;dur=0"
-                    _flights.pop(key, None)
-                    return cached
-            owns_flight = await anyio.to_thread.run_sync(lambda: acquire_flight(key, token))
-        timings: dict[str, float] = {}
-        try:
-            payload = await _compute(req, timings)
-            await anyio.to_thread.run_sync(lambda: set_cached(key, payload))
-        finally:
-            if owns_flight:
-                await anyio.to_thread.run_sync(lambda: release_flight(key, token))
-        response.headers["X-Search-Cache"] = "MISS"
-        response.headers["Server-Timing"] = _timing_header(timings)
-        logger.info("search query=%r results=%d timings=%s", query, payload["total"], timings)
-    _flights.pop(key, None)
+
+    timings: dict[str, float] = {}
+    try:
+        payload = await _compute(req, timings)
+        await anyio.to_thread.run_sync(lambda: set_cached(key, payload))
+    finally:
+        if owns_flight:
+            await anyio.to_thread.run_sync(lambda: release_flight(key, token))
+        ev = _flight_events.pop(key, None)
+        if ev is not None:
+            ev.set()
+    response.headers["X-Search-Cache"] = "MISS"
+    response.headers["Server-Timing"] = _timing_header(timings)
+    logger.info("search query=%r results=%d timings=%s", query, payload["total"], timings)
     return payload
 
 
