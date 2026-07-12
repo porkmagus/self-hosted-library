@@ -163,7 +163,7 @@ EMBED_BATCH_DELAY=0.0
 OLLAMA_MAX_LOADED_MODELS=1
 OLLAMA_NUM_PARALLEL=8
 
-CORS_ORIGINS=http://localhost:3000
+CORS_ORIGINS=http://localhost:8000
 
 SECRET_KEY=${SECRET_KEY}
 EOF
@@ -270,7 +270,7 @@ echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}Self-Hosted Library is ready!${NC}                         ${GREEN}${BOLD}║${NC}"
 echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}  Open:  ${CYAN}http://localhost:3000${NC}                              ${GREEN}${BOLD}║${NC}"
+echo -e "${GREEN}${BOLD}║${NC}  Open:  ${CYAN}http://localhost:8000${NC}                              ${GREEN}${BOLD}║${NC}"
 echo -e "${GREEN}${BOLD}║${NC}  API:   ${CYAN}http://localhost:8000/api/health${NC}                   ${GREEN}${BOLD}║${NC}"
 echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
 echo -e "${GREEN}${BOLD}║${NC}  Drop PDFs into ${CYAN}data/inbox/${NC} and click \"Ingest\"        ${GREEN}${BOLD}║${NC}"

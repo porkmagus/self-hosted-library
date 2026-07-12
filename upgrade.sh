@@ -70,9 +70,9 @@ fi
 
 say "Pulling images (version: ${VERSION})..."
 if $DRY_RUN; then
-    echo "  [dry-run] Would pull api + web images"
+    echo "  [dry-run] Would pull app + worker images"
 else
-    docker compose "${COMPOSE_FILES[@]}" pull api worker web 2>&1 | while IFS= read -r line; do
+    docker compose "${COMPOSE_FILES[@]}" pull app worker 2>&1 | while IFS= read -r line; do
         echo "  $line"
     done
     ok "Images pulled"
@@ -82,14 +82,14 @@ fi
 
 say "Running database migrations..."
 if $DRY_RUN; then
-    echo "  [dry-run] Would run: docker compose run --rm api alembic upgrade head"
+    echo "  [dry-run] Would run: docker compose run --rm app alembic upgrade head"
 else
-    if docker compose "${COMPOSE_FILES[@]}" run --rm -T api alembic upgrade head 2>&1; then
+    if docker compose "${COMPOSE_FILES[@]}" run --rm -T app alembic upgrade head 2>&1; then
         ok "Migrations complete"
     else
         fail "Migration failed — rolling back"
-        docker compose "${COMPOSE_FILES[@]}" down api worker web 2>/dev/null || true
-        docker compose "${COMPOSE_FILES[@]}" up -d --wait api worker web 2>&1 | tail -3
+        docker compose "${COMPOSE_FILES[@]}" down app worker 2>/dev/null || true
+        docker compose "${COMPOSE_FILES[@]}" up -d --wait app worker 2>&1 | tail -3
         fail "Upgrade aborted. Previous version restored."
         exit 1
     fi
@@ -99,9 +99,9 @@ fi
 
 say "Restarting services..."
 if $DRY_RUN; then
-    echo "  [dry-run] Would restart api + worker + web"
+    echo "  [dry-run] Would restart app + worker"
 else
-    docker compose "${COMPOSE_FILES[@]}" up -d --wait api worker web 2>&1 | while IFS= read -r line; do
+    docker compose "${COMPOSE_FILES[@]}" up -d --wait app worker 2>&1 | while IFS= read -r line; do
         echo "  $line"
     done
     ok "Services restarted"
@@ -121,7 +121,7 @@ else
         if [ "$i" -eq 30 ]; then
             fail "API health check failed after 30 attempts — rolling back"
             cp "$BACKUP" .env
-            docker compose "${COMPOSE_FILES[@]}" up -d --wait api worker web 2>&1 | tail -3
+            docker compose "${COMPOSE_FILES[@]}" up -d --wait app worker 2>&1 | tail -3
             fail "Upgrade aborted. Previous version restored."
             exit 1
         fi

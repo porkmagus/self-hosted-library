@@ -1,14 +1,16 @@
 # Self-Hosted Library
 
-A GPU-first, self-hosted document ingestion, semantic retrieval, and research system.
+A GPU-first, self-hosted document ingestion, semantic retrieval, and research system. One image, one compose file, one command to start.
 
 ## Quick start
 
 ```bash
+git clone https://github.com/porkmagus/self-hosted-library.git
+cd self-hosted-library
 ./setup.sh
 ```
 
-That's it. The script detects your hardware, generates credentials, pulls the embedding model, and starts all services. Open http://localhost:3000 when it finishes.
+That's it. The script detects your hardware, generates credentials, pulls the embedding model, and starts all services. Open http://localhost:8000 when it finishes.
 
 Drop PDFs (or EPUBs, DOCXs, text files) into `data/inbox/` and click "Start Ingestion" in the web UI.
 
@@ -26,22 +28,22 @@ Drop PDFs (or EPUBs, DOCXs, text files) into `data/inbox/` and click "Start Inge
 | `./setup.sh` | One-command bootstrap: detect hardware, generate `.env`, pull model, start services |
 | `./doctor.sh` | Health check: Docker, GPU, disk, ports, containers, API, embedding |
 | `./reset.sh` | Stop services. `--volumes` wipes data. `--hard` also removes `.env` |
+| `./upgrade.sh` | Safe update: backup, pull, migrate, health check, rollback on failure |
 
 ## Architecture
 
 ```
-┌──────────┐   ┌──────────┐   ┌──────────┐
-│  React   │   │ FastAPI  │   │ Celery   │
-│  (nginx) │──▶│  (uvicorn)│◀──│  worker  │
-│  :3000   │   │  :8000   │   │          │
-└──────────┘   └────┬─────┘   └────┬─────┘
-                    │              │
-         ┌──────────┼──────────────┼──────────┐
-         │          │              │          │
-    ┌────▼──┐ ┌────▼──┐ ┌──────┐ ┌▼─────┐ ┌──▼───┐
-    │Qdrant │ │Postgre│ │Redis │ │MinIO │ │Ollama│
-    │ :6333 │ │ :5432 │ │:6379 │ │:9000 │ │:11434│
-    └───────┘ └───────┘ └──────┘ └──────┘ └──────┘
+┌──────────────────────────────────────┐
+│  FastAPI + React (single container)  │
+│  :8000 — / (UI) + /api/* (REST)      │
+└──────────────┬───────────────────────┘
+               │
+    ┌──────────┼──────────────┬──────────┐
+    │          │              │          │
+┌───▼──┐ ┌────▼──┐ ┌──────┐ ┌▼─────┐ ┌──▼───┐
+│Qdrant│ │Postgre│ │Redis │ │MinIO │ │Ollama│
+│:6333 │ │:5432 │ │:6379 │ │:9000 │ │:11434│
+└──────┘ └──────┘ └──────┘ └──────┘ └──────┘
 ```
 
 - **Qdrant** — vector search (dense + keyword hybrid with RRF fusion)
@@ -77,20 +79,23 @@ npm test && npm run typecheck && npm run build
 
 ## Deployment
 
-Pre-built images are published to `ghcr.io/porkmagus/self-hosted-library` on every tag. The `compose.yaml` uses local builds by default; switch to images by setting:
+Pre-built images are published to `ghcr.io/porkmagus/self-hosted-library` on every tag. `setup.sh` uses them by default. To build locally:
 
-```yaml
-# In compose.yaml or an override:
-services:
-  api:
-    image: ghcr.io/porkmagus/self-hosted-library-api:latest
-    build: !reset null
-  worker:
-    image: ghcr.io/porkmagus/self-hosted-library-api:latest
-    build: !reset null
-  web:
-    image: ghcr.io/porkmagus/self-hosted-library-web:latest
-    build: !reset null
+```bash
+./setup.sh --dev
+```
+
+Or use the compose files directly:
+
+```bash
+# Pre-built images (default)
+docker compose -f compose.yaml -f compose.images.yaml up -d
+
+# Local build
+docker compose up -d
+
+# With GPU
+docker compose -f compose.yaml -f compose.images.yaml -f compose.gpu.yaml up -d
 ```
 
 ## Data safety

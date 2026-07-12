@@ -94,7 +94,7 @@ fi
 
 $JSON_OUT || echo -e "${CYAN}Ports${NC}"
 
-for port in 3000 8000 5432 6379 6333 9000 11434; do
+for port in 8000 5432 6379 6333 9000 11434; do
     if ss -tlnp 2>/dev/null | grep -q ":${port} " || netstat -tlnp 2>/dev/null | grep -q ":${port} "; then
         pass "port-${port}" "listening"
     else
@@ -106,7 +106,7 @@ done
 
 $JSON_OUT || echo -e "${CYAN}Containers${NC}"
 
-EXPECTED=(qdrant postgres redis minio ollama api worker web)
+EXPECTED=(qdrant postgres redis minio ollama app worker)
 for svc in "${EXPECTED[@]}"; do
     if docker compose ps --format json 2>/dev/null | grep -q "\"Service\":\"${svc}\""; then
         HEALTH=$(docker inspect "$(docker compose ps -q "$svc" 2>/dev/null)" --format '{{.State.Health.Status}}' 2>/dev/null || echo unknown)

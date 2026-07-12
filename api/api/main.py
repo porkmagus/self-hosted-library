@@ -1,4 +1,4 @@
-"""Self-hosted library API entry point."""
+"""Self-hosted library API entry point — serves both API and React frontend."""
 
 from __future__ import annotations
 
@@ -6,12 +6,14 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.config import settings as app_settings
 from api.models import get_engine, init_db
@@ -122,3 +124,18 @@ app.include_router(ingest.router, prefix="/api", tags=["ingest"])
 app.include_router(book_viewer.router, prefix="/api", tags=["viewer"])
 app.include_router(media.router, prefix="/api/media", tags=["media"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
+
+# ── Serve React SPA ─────────────────────────────────────────────────────────
+
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+if STATIC_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str) -> FileResponse:
+        """Serve React SPA — fallback to index.html for client-side routing."""
+        path = STATIC_DIR / full_path
+        if path.is_file():
+            return FileResponse(path)
+        return FileResponse(STATIC_DIR / "index.html")
