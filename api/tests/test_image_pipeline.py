@@ -1,9 +1,12 @@
 import io
+import shutil
 from pathlib import Path
 
 import fitz
+import pytest
 from PIL import Image
 
+from api.services import image_svc
 from api.services.image_svc import extract_images_from_pdf
 
 
@@ -42,3 +45,37 @@ def test_pdf_image_identity_is_stable_for_repeated_extraction(tmp_path: Path) ->
     second = extract_images_from_pdf(str(path), "book-1", "Illustrated Grimoire")
 
     assert first[0]["image_id"] == second[0]["image_id"]
+
+
+def test_pdf_image_identity_is_independent_of_worker_temp_path(tmp_path: Path) -> None:
+    first_path = tmp_path / "worker-a" / "source.pdf"
+    second_path = tmp_path / "worker-b" / "renamed.pdf"
+    first_path.parent.mkdir()
+    second_path.parent.mkdir()
+    _write_pdf_with_image(first_path)
+    shutil.copyfile(first_path, second_path)
+
+    first = extract_images_from_pdf(str(first_path), "book-1", "Illustrated")
+    second = extract_images_from_pdf(str(second_path), "book-1", "Illustrated")
+
+    assert first[0]["image_id"] == second[0]["image_id"]
+
+
+def test_corrupt_pdf_image_extraction_is_not_silently_treated_as_empty(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "corrupt.pdf"
+    path.write_bytes(b"not a pdf")
+
+    with pytest.raises(fitz.FileDataError):
+        extract_images_from_pdf(str(path), "book-1", "Corrupt")
+
+
+def test_extracted_images_are_normalized_to_streamable_png() -> None:
+    source = io.BytesIO()
+    Image.new("RGB", (12, 12), "purple").save(source, format="BMP")
+
+    payload, extension = image_svc.normalize_image_bytes(source.getvalue())
+
+    assert extension == "png"
+    assert payload.startswith(b"\x89PNG\r\n\x1a\n")

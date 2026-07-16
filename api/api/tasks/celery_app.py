@@ -1,35 +1,53 @@
-"""Celery application configuration and ingestion tasks."""
+"""Celery boundaries for fenced ingestion, activation, and outbox dispatch."""
 
 from __future__ import annotations
 
 import logging
 import uuid
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from celery import Celery
+from sqlalchemy import func, or_, select, text
 
 from api.config import settings
-from api.models import Book, BookStatus, get_db_session
-from api.services.image_svc import extract_images_from_pdf
-from api.services.minio_svc import upload_object
-from api.services.ollama_svc import (
-    embed_with_recursive_bisection,
-    get_embedding_batch,
+from api.models import (
+    Book,
+    BookStatus,
+    IngestionJob,
+    IngestionOutbox,
+    IngestionState,
+    OutboxState,
+    get_db_session,
 )
-from api.services.parser_svc import (
-    chunk_text_semantic,
-    compute_file_hash,
-    convert_pdf_with_marker,
-    extract_docx,
-    extract_epub,
-    extract_pdf_pymupdf,
-    extract_text_file,
-    sanitize_filename,
+from api.services.image_svc import retire_other_image_activations
+from api.services.ingestion_activation import reconcile_generation_activation
+from api.services.ingestion_cleanup import (
+    cleanup_deleted_book,
+    cleanup_stale_upload_reservations,
 )
-from api.services.qdrant_svc import upsert_chunks
+from api.services.ingestion_jobs import (
+    JobLease,
+    LeaseUnavailable,
+    StaleLease,
+    fail_job,
+    release_for_retry,
+)
+from api.services.ingestion_outbox import (
+    claim_dispatch_events,
+    create_dispatch_event,
+    mark_publish_failed,
+    mark_published,
+)
+from api.services.ingestion_pipeline import InvalidDocumentError, run_ingestion_pipeline
+from api.services.ingestion_recovery import recover_reconciliation_events
+from api.services.ingestion_submit import submit_uploaded_book
+from api.services.object_store import get_object_store
+from api.services.qdrant_svc import retire_other_activations
 
 logger = logging.getLogger(__name__)
+MAX_INGEST_RETRIES = 8
 
 
 def make_celery() -> Celery:
@@ -43,9 +61,26 @@ def make_celery() -> Celery:
         timezone="UTC",
         enable_utc=True,
         task_track_started=True,
-        task_time_limit=7200,  # 2h per task
+        task_time_limit=None,
+        task_soft_time_limit=None,
         worker_prefetch_multiplier=1,
         task_acks_late=True,
+        task_reject_on_worker_lost=True,
+        broker_transport_options={"visibility_timeout": 12 * 60 * 60},
+        beat_schedule={
+            "publish-ingestion-outbox": {
+                "task": "ingest.dispatch_outbox",
+                "schedule": 5.0,
+            },
+            "recover-durable-ingestion-jobs": {
+                "task": "ingest.recover",
+                "schedule": 30.0,
+            },
+            "cleanup-stale-upload-reservations": {
+                "task": "ingest.cleanup_stale_uploads",
+                "schedule": 600.0,
+            },
+        },
     )
     return app
 
@@ -53,207 +88,336 @@ def make_celery() -> Celery:
 celery_app = make_celery()
 
 
-@celery_app.task(bind=True, name="ingest.book")
-def ingest_book_task(self: Any, book_path: str) -> dict[str, Any]:
-    """Ingest a single book: parse -> chunk -> embed -> index + extract images."""
-    book: Book | None = None
-    with get_db_session() as db:
+def _owner(task: Any) -> str:
+    task_id = getattr(task.request, "id", None) or str(uuid.uuid4())
+    hostname = getattr(task.request, "hostname", None) or "worker"
+    return f"{hostname}:{task_id}"
+
+
+def _owned_lease(job: IngestionJob, owner: str) -> JobLease | None:
+    if (
+        job.state != IngestionState.RUNNING
+        or job.lease_owner != owner
+        or not job.lease_token
+        or not job.lease_expires_at
+    ):
+        return None
+    expires = job.lease_expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return JobLease(
+        job_uuid=job.uuid,
+        generation=job.generation,
+        owner=owner,
+        token=job.lease_token,
+        claim_epoch=job.claim_epoch,
+        expires_at=expires,
+        next_chunk_index=job.next_chunk_index,
+        indexed_chunks=job.indexed_chunks,
+    )
+
+
+def _transition_failure(
+    job_uuid: str,
+    owner: str,
+    exc: Exception,
+    *,
+    terminal: bool,
+    error_code: str,
+) -> bool:
+    with get_db_session() as session:
+        job = session.execute(
+            select(IngestionJob).where(IngestionJob.uuid == job_uuid)
+        ).scalar_one_or_none()
+        if job is None:
+            return False
+        lease = _owned_lease(job, owner)
+        if lease is None:
+            return False
         try:
-            book_path_obj = Path(book_path)
-            if not book_path_obj.exists():
-                raise FileNotFoundError(f"Book not found: {book_path}")
-
-            file_hash = compute_file_hash(book_path_obj)
-            original_name = book_path_obj.name
-            sanitized = sanitize_filename(book_path_obj.stem)
-            ext = book_path_obj.suffix.lower()
-
-            book = db.query(Book).filter(Book.file_hash == file_hash).first()
-            if book is None:
-                book_uuid = str(uuid.uuid4())
-                book = Book(
-                    uuid=book_uuid,
-                    title=book_path_obj.stem.replace("_", " ").title(),
-                    original_filename=original_name,
-                    sanitized_filename=sanitized,
-                    file_extension=ext,
-                    file_size_bytes=book_path_obj.stat().st_size,
-                    file_hash=file_hash,
-                    status=BookStatus.EXTRACTING,
+            if terminal or job.attempt_count >= job.max_attempts:
+                fail_job(
+                    session,
+                    lease,
+                    error_code=error_code,
+                    error_message=str(exc),
+                    error_class=type(exc).__name__,
                 )
-                db.add(book)
-                db.commit()
-            else:
-                book_uuid = book.uuid
-                if book.status == BookStatus.INDEXED:
-                    return {
-                        "book_id": book_uuid,
-                        "indexed_chunks": book.indexed_chunks,
-                        "status": "already_indexed",
-                    }
-                book.status = BookStatus.EXTRACTING
-                db.commit()
-
-            self.update_state(
-                state="STARTED",
-                meta={"book_id": book_uuid, "status": "extracting", "progress": 5},
-            )
-
-            # ── Step 1: Parse to text ──────────────────────────
-            text = ""
-            output_dir = Path(settings.DATA_DIR) / "markdown"
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            if ext == ".pdf":
-                md_path = convert_pdf_with_marker(book_path_obj, output_dir)
-                if md_path and md_path.exists():
-                    text = md_path.read_text(encoding="utf-8")
-                    book.markdown_path = str(md_path)
-                else:
-                    text = extract_pdf_pymupdf(book_path_obj)
-            elif ext == ".epub":
-                text = extract_epub(book_path_obj)
-            elif ext in (".docx", ".doc"):
-                text = extract_docx(book_path_obj)
-            elif ext in (".txt", ".md", ".htm", ".html"):
-                text = extract_text_file(book_path_obj)
-            else:
-                raise ValueError(f"Unsupported format: {ext}")
-
-            if not text or len(text.strip()) < 50:
-                raise ValueError(
-                    f"Extracted text is too short or empty for {original_name}"
-                )
-
-            # ── Step 1b: Extract images from PDFs ───────────────
-            if ext == ".pdf":
-                logger.info("Extracting images from %s", original_name)
-                images = extract_images_from_pdf(
-                    str(book_path_obj), book.uuid, book.title
-                )
-                if images:
-                    logger.info("Found %d images in %s", len(images), original_name)
-
-            book.status = BookStatus.CHUNKING
-            db.commit()
-            self.update_state(
-                state="STARTED",
-                meta={"book_id": book_uuid, "status": "chunking", "progress": 20},
-            )
-
-            # ── Step 2: Semantic chunking ──────────────────────
-            chunks = chunk_text_semantic(text)
-            book.total_chunks = len(chunks)
-            db.commit()
-
-            self.update_state(
-                state="STARTED",
-                meta={"book_id": book_uuid, "status": "embedding", "progress": 30},
-            )
-
-            # ── Step 3: Embed with batching + poison recovery ──
-            batch_size = settings.EMBED_BATCH_SIZE
-            total_batches = (len(chunks) + batch_size - 1) // batch_size
-            total_indexed = 0
-
-            for batch_idx in range(total_batches):
-                start = batch_idx * batch_size
-                end = min(start + batch_size, len(chunks))
-                batch_texts = chunks[start:end]
-
-                embeddings = get_embedding_batch(batch_texts)
-
-                successful_pairs = []
-                for _i, (txt, emb) in enumerate(zip(batch_texts, embeddings, strict=False)):
-                    if emb is not None:
-                        successful_pairs.append((txt, emb))
-                    else:
-                        fragments = embed_with_recursive_bisection(txt)
-                        frag_embs = get_embedding_batch(fragments)
-                        for frag_text, frag_emb in zip(fragments, frag_embs, strict=False):
-                            if frag_emb is not None:
-                                successful_pairs.append((frag_text, frag_emb))
-
-                if successful_pairs:
-                    upserted = upsert_chunks(
-                        chunks=successful_pairs,
-                        book_id=book_uuid,
-                        book_title=book.title,
-                        source_key=original_name,
-                        page_number=batch_idx + 1,
-                    )
-                    total_indexed += upserted
-
-                progress = 30 + int(70 * (end / len(chunks)))
-                book.indexed_chunks = total_indexed
-                db.commit()
-                self.update_state(
-                    state="STARTED",
-                    meta={
-                        "book_id": book_uuid,
-                        "status": "embedding",
-                        "progress": progress,
-                        "indexed_chunks": total_indexed,
-                        "total_chunks": len(chunks),
-                    },
-                )
-
-            # ── Step 5: Upload to MinIO ────────────────────────
-            object_key = f"{sanitized}{ext}"
-            upload_object(object_key, book_path_obj.read_bytes())
-            book.minio_object_key = object_key
-            book.status = BookStatus.INDEXED
-            db.commit()
-
-            self.update_state(
-                state="STARTED",
-                meta={"book_id": book_uuid, "status": "indexed", "progress": 100},
-            )
-
-            logger.info("Successfully indexed %s: %d chunks", original_name, total_indexed)
-            return {
-                "book_id": book_uuid,
-                "indexed_chunks": total_indexed,
-                "status": "indexed",
-            }
-
-        except Exception as e:
-            error_msg = str(e)
-            logger.exception("Ingestion failed for %s", book_path)
-            db.rollback()
-            try:
+                book = session.get(Book, job.book_id)
                 if book is not None:
                     book.status = BookStatus.FAILED
-                    book.error_message = error_msg[:2000]
-                    db.commit()
-            except Exception:
-                logger.exception("Failed to persist ingestion failure for %s", book_path)
+                    book.error_message = str(exc)[:2000]
+            else:
+                now = session.execute(select(func.now())).scalar_one()
+                retries = max(0, job.attempt_count - 1)
+                release_for_retry(
+                    session,
+                    lease,
+                    error_code=error_code,
+                    error_message=str(exc),
+                    error_class=type(exc).__name__,
+                    retry_at=now + timedelta(seconds=min(300, 5 * (2**retries))),
+                )
+            session.commit()
+            return True
+        except StaleLease:
+            session.rollback()
+            return False
+
+
+@celery_app.task(bind=True, name="ingest.job", max_retries=MAX_INGEST_RETRIES)
+def ingest_job_task(self: Any, job_uuid: str) -> dict[str, Any]:
+    """Execute only a durable job UUID; PostgreSQL owns all resumable state."""
+    owner = _owner(self)
+    try:
+        return run_ingestion_pipeline(job_uuid, owner)
+    except LeaseUnavailable as exc:
+        logger.info("Skipping duplicate delivery for %s: %s", job_uuid, exc)
+        return {"job_uuid": job_uuid, "status": "leased_or_terminal"}
+    except InvalidDocumentError as exc:
+        _transition_failure(
+            job_uuid,
+            owner,
+            exc,
+            terminal=True,
+            error_code="invalid_document",
+        )
+        return {"job_uuid": job_uuid, "status": "failed", "error": str(exc)}
+    except Exception as exc:
+        logger.exception("Transient ingestion failure for %s", job_uuid)
+        transitioned = _transition_failure(
+            job_uuid,
+            owner,
+            exc,
+            terminal=False,
+            error_code="transient_dependency_failure",
+        )
+        if not transitioned:
+            return {"job_uuid": job_uuid, "status": "stale_worker"}
+        retries = int(getattr(self.request, "retries", 0))
+        if retries >= MAX_INGEST_RETRIES:
             raise
+        raise self.retry(exc=exc, countdown=min(300, 5 * (2**retries))) from exc
+
+
+@celery_app.task(bind=True, name="ingest.activate", max_retries=MAX_INGEST_RETRIES)
+def activate_generation_task(self: Any, job_uuid: str) -> dict[str, Any]:
+    try:
+        with get_db_session() as session:
+            result = reconcile_generation_activation(session, job_uuid)
+            session.commit()
+        book_id = str(result["book_id"])
+        activation_token = str(result["activation_token"])
+        with get_db_session() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:book_uuid))"),
+                    {"book_uuid": book_id},
+                )
+            book = session.execute(
+                select(Book).where(Book.uuid == book_id).with_for_update()
+            ).scalar_one()
+            if book.indexed_activation_token == activation_token:
+                retire_other_activations(book_id, activation_token)
+                retire_other_image_activations(book_id, activation_token)
+                book.activation_cleanup_pending = False
+            session.commit()
+        return result
+    except Exception as exc:
+        logger.exception("Generation activation failed for %s", job_uuid)
+        retries = int(getattr(self.request, "retries", 0))
+        raise self.retry(exc=exc, countdown=min(300, 5 * (2**retries))) from exc
+
+
+@celery_app.task(bind=True, name="ingest.cleanup_book", max_retries=MAX_INGEST_RETRIES)
+def cleanup_book_task(self: Any, book_uuid: str) -> dict[str, Any]:
+    try:
+        with get_db_session() as session:
+            result = cleanup_deleted_book(session, book_uuid)
+            session.commit()
+            return result
+    except Exception as exc:
+        logger.exception("Book cleanup failed for %s", book_uuid)
+        retries = int(getattr(self.request, "retries", 0))
+        raise self.retry(exc=exc, countdown=min(300, 5 * (2**retries))) from exc
+
+
+@celery_app.task(name="ingest.cleanup_stale_uploads")
+def cleanup_stale_uploads() -> dict[str, int]:
+    with get_db_session() as session:
+        cleaned = cleanup_stale_upload_reservations(session)
+        session.commit()
+    return {"cleaned": cleaned}
+
+
+@celery_app.task(name="ingest.file")
+def ingest_book_task(book_path: str) -> dict[str, Any]:
+    """Import a server-local file through the durable object-backed boundary."""
+    path = Path(book_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Book not found: {book_path}")
+    with path.open("rb") as source, get_db_session() as session:
+        result = submit_uploaded_book(
+            session,
+            filename=path.name,
+            content_type="application/octet-stream",
+            stream=source,
+            store=get_object_store(),
+        )
+    return {
+        "book_id": result.book_uuid,
+        "job_uuid": result.job_uuid,
+        "task_id": result.task_id,
+        "status": "queued",
+    }
 
 
 @celery_app.task(bind=True, name="ingest.batch")
 def ingest_batch_task(self: Any, book_paths: list[str]) -> dict[str, Any]:
-    """Ingest a batch of books — fire-and-forget, no blocking .get()."""
     total = len(book_paths)
-
-    for i, path in enumerate(book_paths):
+    for index, path in enumerate(book_paths):
         ingest_book_task.delay(path)
         self.update_state(
             state="STARTED",
             meta={
                 "status": "batch_queued",
-                "progress": int((i + 1) / total * 100),
-                "current": i + 1,
+                "progress": int((index + 1) / total * 100),
+                "current": index + 1,
                 "total": total,
             },
         )
-
-    return {
-        "total": total,
-        "status": "all_queued",
-        "message": f"Queued {total} books for ingestion. Track progress via /api/ingest/{{task_id}}/progress",
-    }
+    return {"total": total, "status": "all_queued"}
 
 
-# Register additional task modules (side-effect import)
-from api.tasks import image_tasks as _image_tasks  # noqa: F401
+@celery_app.task(name="ingest.dispatch_outbox")
+def dispatch_outbox(limit: int = 100) -> dict[str, int]:
+    """Publish claimed outbox rows; uncertain publishes are safely redelivered."""
+    with get_db_session() as session:
+        events = claim_dispatch_events(session, limit=limit)
+        session.commit()
+
+    published = 0
+    failed = 0
+    for event in events:
+        try:
+            if event.event_type == "dispatch_ingestion":
+                if event.job_uuid is None:
+                    raise ValueError("Dispatch event has no job UUID")
+                task_id = str(ingest_job_task.delay(event.job_uuid).id)
+            elif event.event_type == "activate_generation":
+                if event.job_uuid is None:
+                    raise ValueError("Activation event has no job UUID")
+                task_id = str(activate_generation_task.delay(event.job_uuid).id)
+            elif event.event_type == "cleanup_book":
+                task_id = str(cleanup_book_task.delay(event.aggregate_uuid).id)
+            else:
+                raise ValueError(f"Unsupported outbox event: {event.event_type}")
+            with get_db_session() as session:
+                mark_published(session, event.uuid, task_id=task_id)
+                session.commit()
+            published += 1
+        except Exception as exc:
+            logger.exception("Outbox publish failed for %s", event.uuid)
+            with get_db_session() as session:
+                mark_publish_failed(
+                    session,
+                    event.uuid,
+                    error=str(exc),
+                    retry_seconds=10,
+                )
+                session.commit()
+            failed += 1
+    return {"published": published, "failed": failed}
+
+
+@celery_app.task(name="ingest.recover")
+def recover_durable_jobs(limit: int = 100) -> dict[str, int]:
+    """Reset the reusable dispatch event for eligible or expired jobs."""
+    reset = 0
+    exhausted = 0
+    with get_db_session() as session:
+        now = session.execute(select(func.now())).scalar_one()
+        exhausted_ids = list(
+            session.execute(
+                select(IngestionJob.uuid)
+                .where(
+                    IngestionJob.state == IngestionState.RUNNING,
+                    IngestionJob.attempt_count >= IngestionJob.max_attempts,
+                    IngestionJob.lease_expires_at < now,
+                )
+                .limit(limit)
+            ).scalars()
+        )
+        for exhausted_uuid in exhausted_ids:
+            initial = session.execute(
+                select(IngestionJob).where(IngestionJob.uuid == exhausted_uuid)
+            ).scalar_one()
+            book = session.execute(
+                select(Book).where(Book.id == initial.book_id).with_for_update()
+            ).scalar_one()
+            job = session.execute(
+                select(IngestionJob)
+                .where(IngestionJob.uuid == exhausted_uuid)
+                .with_for_update()
+            ).scalar_one()
+            if (
+                job.state == IngestionState.RUNNING
+                and job.attempt_count >= job.max_attempts
+                and job.lease_expires_at is not None
+                and job.lease_expires_at < now
+            ):
+                job.state = IngestionState.FAILED
+                job.finished_at = now
+                job.error_code = "worker_lost_retry_exhausted"
+                job.error_message = "Worker lease expired on the final allowed attempt"
+                job.lease_owner = None
+                job.lease_token = None
+                job.lease_expires_at = None
+                if (
+                    book.deleted_at is None
+                    and book.processing_generation == job.generation
+                ):
+                    book.status = BookStatus.FAILED
+                    book.error_message = job.error_message
+                exhausted += 1
+        jobs = list(
+            session.execute(
+                select(IngestionJob)
+                .where(
+                    IngestionJob.attempt_count < IngestionJob.max_attempts,
+                    or_(
+                        IngestionJob.state == IngestionState.PENDING,
+                        (
+                            (IngestionJob.state == IngestionState.RETRY_WAIT)
+                            & (IngestionJob.retry_at <= now)
+                        ),
+                        (
+                            (IngestionJob.state == IngestionState.RUNNING)
+                            & (IngestionJob.lease_expires_at < now)
+                        ),
+                    ),
+                )
+                .order_by(IngestionJob.created_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            ).scalars()
+        )
+        for job in jobs:
+            event = session.execute(
+                select(IngestionOutbox).where(
+                    IngestionOutbox.job_uuid == job.uuid,
+                    IngestionOutbox.event_type == "dispatch_ingestion",
+                )
+            ).scalar_one_or_none()
+            if event is None:
+                create_dispatch_event(session, job.uuid)
+                reset += 1
+            elif event.state == OutboxState.PUBLISHED:
+                event.state = OutboxState.PENDING
+                event.available_at = now
+                event.claimed_at = None
+                event.last_error = None
+                reset += 1
+        reset += recover_reconciliation_events(session, limit=max(0, limit - reset))
+        session.commit()
+    return {"reset": reset, "exhausted": exhausted}

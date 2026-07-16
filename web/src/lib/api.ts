@@ -4,7 +4,7 @@ import type {
   IngestProgress,
   LocalIngestResponse,
   MediaResponse,
-  PresignResponse,
+  UploadResponse,
   SearchResponse,
   ImageSearchResponse,
 } from "../types"
@@ -105,17 +105,6 @@ export const api = {
       method: "POST",
     }),
 
-  presign: (filename: string, contentType: string) =>
-    request<PresignResponse>(`/upload/presign`, {
-      method: "POST",
-      body: JSON.stringify({ filename, content_type: contentType }),
-    }),
-
-  confirmUpload: (fileId: string, filename: string) =>
-    request<unknown>(
-      `/upload/confirm?file_id=${encodeURIComponent(fileId)}&filename=${encodeURIComponent(filename)}`,
-      { method: "POST" },
-    ),
 
   searchHistory: (limit = 10, signal?: AbortSignal) =>
     request<{ history: Array<{ query: string }>; total: number }>(
@@ -144,23 +133,28 @@ export const api = {
       method: "DELETE",
     }),
 
-  /** Direct PUT to MinIO presigned URL (not via API host). */
-  putFile: async (uploadUrl: string, file: File, onProgress?: (pct: number) => void) => {
-    await new Promise<void>((resolve, reject) => {
+  uploadFile: async (file: File, onProgress?: (pct: number) => void) => {
+    return await new Promise<UploadResponse>((resolve, reject) => {
       const xhr = new XMLHttpRequest()
-      xhr.open("PUT", uploadUrl)
-      xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream")
+      xhr.open("POST", `${API}/upload`)
       xhr.upload.onprogress = (ev) => {
         if (ev.lengthComputable && onProgress) {
           onProgress(Math.round((ev.loaded / ev.total) * 100))
         }
       }
       xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) resolve()
-        else reject(new ApiError(xhr.status, xhr.statusText, xhr.responseText || ""))
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as UploadResponse)
+          } catch {
+            reject(new ApiError(xhr.status, "Invalid JSON response", xhr.responseText || ""))
+          }
+        } else reject(new ApiError(xhr.status, xhr.statusText, xhr.responseText || ""))
       }
       xhr.onerror = () => reject(new Error("Network error during upload"))
-      xhr.send(file)
+      const form = new FormData()
+      form.append("file", file)
+      xhr.send(form)
     })
   },
 }

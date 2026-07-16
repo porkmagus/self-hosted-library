@@ -1,4 +1,5 @@
 """Pure search helpers shared by retrieval, ingestion, and presentation."""
+
 from __future__ import annotations
 
 import re
@@ -17,7 +18,12 @@ def retrieval_limit(limit: int) -> int:
 
 def normalize_display_text(text: str) -> str:
     """Repair only high-confidence OCR/hard-wrap damage; preserve structured text."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ").replace("\u00ad", "")
+    text = (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\u00a0", " ")
+        .replace("\u00ad", "")
+    )
     blocks = re.split(r"\n\s*\n", text)
     fixed: list[str] = []
     for raw in blocks:
@@ -25,14 +31,22 @@ def normalize_display_text(text: str) -> str:
         lines = [line.strip() for line in raw_lines]
         if not lines:
             continue
-        structural = any(
-            _BULLET.match(line) or line.startswith(("#", ">", "```")) or raw_line.startswith(("    ", "\t"))
-            for raw_line, line in zip(raw_lines, lines, strict=True)
-        ) or sum("|" in line for line in lines) >= 2
+        structural = (
+            any(
+                _BULLET.match(line)
+                or line.startswith(("#", ">", "```"))
+                or raw_line.startswith(("    ", "\t"))
+                for raw_line, line in zip(raw_lines, lines, strict=True)
+            )
+            or sum("|" in line for line in lines) >= 2
+        )
         if structural:
             fixed.append("\n".join(raw_lines))
             continue
-        if len(lines) >= 8 and sum(len(line) == 1 for line in lines) / len(lines) >= 0.9:
+        if (
+            len(lines) >= 8
+            and sum(len(line) == 1 for line in lines) / len(lines) >= 0.9
+        ):
             fixed.append("".join(lines))
             continue
         lengths = sorted(len(line) for line in lines)
@@ -41,14 +55,18 @@ def normalize_display_text(text: str) -> str:
         if len(lines) >= 4 and median >= 35 and prose_lines / len(lines) >= 0.7:
             joined = lines[0]
             for line in lines[1:]:
-                joined += ("" if joined.endswith("-") and line[:1].islower() else " ") + line
+                joined += (
+                    "" if joined.endswith("-") and line[:1].islower() else " "
+                ) + line
             fixed.append(joined)
         else:
             fixed.append("\n".join(raw_lines))
     return "\n\n".join(fixed).strip()
 
 
-def diversify_results(results: list[dict[str, Any]], max_per_book: int = 3) -> list[dict[str, Any]]:
+def diversify_results(
+    results: list[dict[str, Any]], max_per_book: int = 3
+) -> list[dict[str, Any]]:
     """Keep ranking mostly intact while preventing one book from owning the first screen."""
     visible: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []

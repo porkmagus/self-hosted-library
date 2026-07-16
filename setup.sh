@@ -1,279 +1,134 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Self-Hosted Library setup ───────────────────────────────────────────────
-# Single-command bootstrap. Detects hardware, generates credentials, writes
-# .env, pulls the embedding model, and starts all services.
-#
-# Usage:
-#   ./setup.sh              # interactive, uses pre-built GHCR images
-#   ./setup.sh --dev        # build images locally instead of pulling from GHCR
-#   ./setup.sh --yes        # non-interactive, overwrites .env if present
-#   ./setup.sh --dry-run    # print what would happen, don't change anything
-# ────────────────────────────────────────────────────────────────────────────
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
 DRY_RUN=false
 YES=false
 DEV=false
+REGENERATE=false
+APP_VERSION="v1.0.0"
+
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
-        --yes|-y)  YES=true ;;
-        --dev)     DEV=true ;;
-        *) echo "Unknown argument: $arg"; exit 1 ;;
+        --yes|-y) YES=true ;;
+        --dev) DEV=true ;;
+        --regenerate) REGENERATE=true ;;
+        --version=*) APP_VERSION="${arg#*=}" ;;
+        *) echo "Unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
 
-say()    { echo -e "${CYAN}→${NC} $*"; }
-ok()     { echo -e "  ${GREEN}✓${NC} $*"; }
-warn()   { echo -e "  ${YELLOW}⚠${NC} $*"; }
-fail()   { echo -e "  ${RED}✗${NC} $*"; }
-header() { echo -e "\n${BOLD}── $* ──${NC}"; }
-# shellcheck disable=SC2120
-dry()    { $DRY_RUN && echo -e "  ${YELLOW}[dry-run]${NC} $*" && return 0; return 1; }
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-
+say() { printf '\n==> %s\n' "$*"; }
+ok() { printf '  OK: %s\n' "$*"; }
+run() { if $DRY_RUN; then printf '  [dry-run] %q ' "$@"; printf '\n'; else "$@"; fi; }
 rand_hex() { openssl rand -hex "${1:-16}"; }
 
-check_cmd() {
-    command -v "$1" >/dev/null 2>&1 || { fail "$1 not found — install it first"; return 1; }
-    ok "$1 found"
-}
+command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
+command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+docker compose version >/dev/null || { echo "Docker Compose v2 is required" >&2; exit 1; }
 
-# ── preflight ───────────────────────────────────────────────────────────────
+declare -a COMPOSE=(docker compose -f compose.yaml)
+$DEV && COMPOSE+=(-f compose.dev.yaml)
 
-header "Preflight checks"
-
-check_cmd docker || exit 1
-check_cmd openssl || exit 1
-
-if docker compose version >/dev/null 2>&1; then
-    COMPOSE="docker compose"
-    ok "docker compose (plugin)"
-elif command -v docker-compose >/dev/null 2>&1; then
-    COMPOSE="docker-compose"
-    ok "docker-compose (standalone)"
+say "Configuration"
+if [ -f .env ] && ! $REGENERATE; then
+    ok "Preserving existing .env (use --regenerate to replace it)"
+elif $DRY_RUN; then
+    echo "  [dry-run] would generate .env with mode 0600"
 else
-    fail "docker compose not found — install Docker Compose plugin"
-    exit 1
-fi
-
-# ── hardware detection ──────────────────────────────────────────────────────
-
-header "Hardware detection"
-
-HAS_GPU=false
-GPU_VRAM=0
-
-if command -v nvidia-smi >/dev/null 2>&1; then
-    if nvidia-smi -L >/dev/null 2>&1; then
-        HAS_GPU=true
-        GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo 0)
-        ok "NVIDIA GPU detected (${GPU_VRAM} MiB VRAM)"
-    else
-        warn "nvidia-smi found but no usable GPU — running CPU-only"
+    if [ -f .env ] && ! $YES; then
+        read -r -p "Replace existing .env? [y/N] " answer
+        case "$answer" in [Yy]*) ;; *) echo "Aborted"; exit 0 ;; esac
     fi
-else
-    warn "No NVIDIA GPU detected — running CPU-only (embeddings will be slower)"
-fi
-
-if $HAS_GPU; then
-    if docker run --rm --gpus all nvidia/cuda:12.6-base-ubuntu24.04 nvidia-smi >/dev/null 2>&1; then
-        ok "NVIDIA Container Toolkit working"
-    else
-        warn "NVIDIA Container Toolkit not configured — GPU won't be available in containers"
-        warn "Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
-        HAS_GPU=false
-    fi
-fi
-
-# ── disk space ──────────────────────────────────────────────────────────────
-
-AVAIL_GB=$(df -BG . | awk 'NR==2 {print $4}' | tr -d 'G')
-if [ "$AVAIL_GB" -lt 20 ]; then
-    warn "Only ${AVAIL_GB} GB free — recommend at least 20 GB for models and indexes"
-else
-    ok "${AVAIL_GB} GB free disk space"
-fi
-
-# ── .env generation ─────────────────────────────────────────────────────────
-
-header "Configuration"
-
-if [ -f .env ] && ! $YES; then
-    warn ".env already exists"
-    read -rp "  Overwrite? [y/N] " yn
-    case "$yn" in
-        [Yy]*) ;;
-        *) say "Keeping existing .env"; ENV_EXISTS=true ;;
-    esac
-fi
-
-if ! ${ENV_EXISTS:-false}; then
-    POSTGRES_PASSWORD=$(rand_hex 16)
-    MINIO_ROOT_PASSWORD=$(rand_hex 16)
-    MINIO_SECRET_KEY=$(rand_hex 16)
-    SECRET_KEY=$(rand_hex 32)
-
-    if dry; then
-        say "Would write .env with generated credentials"
-    else
-        cat > .env <<EOF
-# Generated by setup.sh — $(date -u +%Y-%m-%dT%H:%M:%SZ)
-# Do not commit this file.
-
+    POSTGRES_PASSWORD="$(rand_hex 24)"
+    S3_SECRET_KEY="$(rand_hex 32)"
+    umask 077
+    cat > .env <<EOF
+# Generated by setup.sh
+APP_VERSION=${APP_VERSION}
+APP_BIND_ADDRESS=127.0.0.1
+APP_PORT=8000
 POSTGRES_DB=library
 POSTGRES_USER=library
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 DATABASE_URL=postgresql://library:${POSTGRES_PASSWORD}@postgres:5432/library
-
 REDIS_URL=redis://redis:6379/0
-
 OLLAMA_URL=http://ollama:11434
 EMBED_MODEL=bge-large
 EMBED_DIMENSION=1024
-
 QDRANT_URL=http://qdrant:6333
 QDRANT_COLLECTION=library_documents
 IMAGE_COLLECTION=library_images
-
-MINIO_ROOT_USER=library_admin
-MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-MINIO_ENDPOINT=minio:9000
-MINIO_ACCESS_KEY=library_admin
-MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-MINIO_BUCKET=library-files
-MINIO_PUBLIC_URL=http://localhost:9000
-
-DATA_DIR=/app/data
+IMAGE_SEARCH_MIN_SCORE=0.2
+S3_ENDPOINT=seaweedfs:8333
+S3_ACCESS_KEY=library_admin
+S3_SECRET_KEY=${S3_SECRET_KEY}
+S3_BUCKET=library-files
+SEAWEEDFS_S3_CONFIG_PATH=./.state/seaweedfs-s3.json
 EMBED_BATCH_SIZE=512
 EMBED_BATCH_DELAY=0.0
-
 OLLAMA_MAX_LOADED_MODELS=1
-OLLAMA_NUM_PARALLEL=8
-
+OLLAMA_NUM_PARALLEL=2
+WORKER_CONCURRENCY=2
 CORS_ORIGINS=http://localhost:8000
-
-SECRET_KEY=${SECRET_KEY}
 EOF
-        chmod 600 .env
-        ok ".env written with generated credentials (chmod 600)"
-    fi
+    chmod 600 .env
+    ok "Generated .env"
 fi
 
-# ── directories ─────────────────────────────────────────────────────────────
+env_value() {
+    local key="$1" default="${2:-}" value
+    if [ ! -f .env ]; then printf '%s' "$default"; return; fi
+    value="$(awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' .env)"
+    printf '%s' "${value:-$default}"
+}
 
-header "Data directories"
-
-for d in data models data/inbox data/markdown; do
-    if [ -d "$d" ]; then
-        ok "$d exists"
-    else
-        if dry; then
-            say "Would create $d"
-        else
-            mkdir -p "$d"
-            ok "$d created"
-        fi
-    fi
-done
-
-# ── compose files ───────────────────────────────────────────────────────────
-
-header "Compose configuration"
-
-COMPOSE_FILES=(-f compose.yaml)
-if ! $DEV && [ -f compose.images.yaml ]; then
-    COMPOSE_FILES+=(-f compose.images.yaml)
-    ok "Using pre-built GHCR images (--dev to build locally)"
-elif $DEV; then
-    ok "Building images locally (--dev mode)"
-fi
-if $HAS_GPU && [ -f compose.gpu.yaml ]; then
-    COMPOSE_FILES+=(-f compose.gpu.yaml)
-    ok "GPU overlay active (compose.gpu.yaml)"
+say "Private object-store identity"
+if $DRY_RUN; then
+    echo "  [dry-run] would generate .state/seaweedfs-s3.json with mode 0600"
 else
-    ok "CPU-only mode"
+    mkdir -p .state
+    S3_ACCESS_KEY_VALUE="$(env_value S3_ACCESS_KEY library_admin)" \
+    S3_SECRET_KEY_VALUE="$(env_value S3_SECRET_KEY)" \
+        python3 -c 'import json, os, pathlib
+p = pathlib.Path(".state/seaweedfs-s3.json")
+payload = {"identities": [{"name": "library", "credentials": [{"accessKey": os.environ["S3_ACCESS_KEY_VALUE"], "secretKey": os.environ["S3_SECRET_KEY_VALUE"]}], "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+p.write_text(json.dumps(payload, separators=(",", ":")) + "\n")'
+    chmod 600 .state/seaweedfs-s3.json
+    ok "Generated private SeaweedFS S3 identity"
 fi
 
-if dry; then
-    say "Would validate compose config"
+say "Compose validation"
+if $DRY_RUN && [ ! -f .env ]; then
+    ok "Skipped resolved validation until .env exists"
 else
-    if $COMPOSE "${COMPOSE_FILES[@]}" config --quiet 2>/dev/null; then
-        ok "Compose config valid"
-    else
-        fail "Compose config invalid — check .env values"
-        $COMPOSE "${COMPOSE_FILES[@]}" config 2>&1 | head -20
-        exit 1
-    fi
+    "${COMPOSE[@]}" config --quiet
+    ok "Resolved Compose model is valid"
 fi
 
-# ── start services ──────────────────────────────────────────────────────────
+say "Starting stateful dependencies"
+run "${COMPOSE[@]}" up -d --wait postgres redis qdrant seaweedfs ollama
 
-header "Starting services"
+say "Embedding model"
+run "${COMPOSE[@]}" exec -T ollama ollama pull "$(env_value EMBED_MODEL bge-large)"
 
-if dry; then
-    say "Would run: $COMPOSE ${COMPOSE_FILES[*]} up -d --wait"
-else
-    say "Pulling images and starting containers (this may take a few minutes)..."
-    $COMPOSE "${COMPOSE_FILES[@]}" pull --quiet 2>/dev/null || true
-    $COMPOSE "${COMPOSE_FILES[@]}" up -d --wait 2>&1 | while IFS= read -r line; do
-        echo "  $line"
-    done
-    ok "All services healthy"
+say "Private object-store bucket"
+run "${COMPOSE[@]}" run --rm -T app python -c \
+    "from api.services.object_store import get_object_store; get_object_store().ensure_bucket()"
+
+say "Database migrations"
+run "${COMPOSE[@]}" run --rm -T app alembic upgrade head
+
+say "Starting application services"
+run "${COMPOSE[@]}" up -d --wait app worker beat
+
+if ! $DRY_RUN; then
+    curl -fsS "http://127.0.0.1:$(env_value APP_PORT 8000)/api/health" >/dev/null
+    ok "API is healthy"
 fi
 
-# ── pull embedding model ────────────────────────────────────────────────────
-
-header "Embedding model"
-
-if dry; then
-    say "Would pull embedding model: bge-large"
-else
-    say "Pulling embedding model (bge-large) — this downloads ~1.3 GB..."
-    if curl -sSf "http://127.0.0.1:11434/api/pull" -d '{"name":"bge-large","stream":false}' >/dev/null 2>&1; then
-        ok "Embedding model pulled"
-    else
-        warn "Could not pull embedding model — pull manually:"
-        warn "  curl http://127.0.0.1:11434/api/pull -d '{\"name\":\"bge-large\",\"stream\":false}'"
-    fi
-fi
-
-# ── verify ──────────────────────────────────────────────────────────────────
-
-header "Verification"
-
-if dry; then
-    say "Would verify API health"
-else
-    if curl -sSf "http://127.0.0.1:8000/api/health" >/dev/null 2>&1; then
-        ok "API responding"
-    else
-        warn "API not responding yet — it may still be initializing"
-    fi
-fi
-
-# ── done ────────────────────────────────────────────────────────────────────
-
-echo ""
-echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}${BOLD}║${NC}  ${BOLD}Self-Hosted Library is ready!${NC}                         ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}  Open:  ${CYAN}http://localhost:8000${NC}                              ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}  API:   ${CYAN}http://localhost:8000/api/health${NC}                   ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}                                                          ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}  Drop PDFs into ${CYAN}data/inbox/${NC} and click \"Ingest\"        ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}║${NC}  Run ${CYAN}./doctor.sh${NC} to verify system health               ${GREEN}${BOLD}║${NC}"
-echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
-echo ""
+printf '\nSelf-Hosted Library is ready at http://localhost:%s\n' "$(env_value APP_PORT 8000)"
+printf 'Run ./doctor.sh for a full deployment check.\n'

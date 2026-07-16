@@ -65,21 +65,29 @@ def _call_embed_with_retry(
                 f"{settings.OLLAMA_URL}/api/embed",
                 json=payload,
             )
-            if resp.status_code == 503 or (resp.status_code >= 500 and attempt < max_retries - 1):
-                delay = base_delay * (2 ** attempt)
+            if resp.status_code == 503 or (
+                resp.status_code >= 500 and attempt < max_retries - 1
+            ):
+                delay = base_delay * (2**attempt)
                 logger.warning(
                     "Ollama returned %d, retrying in %.1fs (attempt %d/%d)",
-                    resp.status_code, delay, attempt + 1, max_retries,
+                    resp.status_code,
+                    delay,
+                    attempt + 1,
+                    max_retries,
                 )
                 time.sleep(delay)
                 continue
             return resp
         except httpx.HTTPError as exc:
             if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
+                delay = base_delay * (2**attempt)
                 logger.warning(
                     "Ollama request failed: %s, retrying in %.1fs (attempt %d/%d)",
-                    exc, delay, attempt + 1, max_retries,
+                    exc,
+                    delay,
+                    attempt + 1,
+                    max_retries,
                 )
                 time.sleep(delay)
             else:
@@ -113,12 +121,17 @@ def get_embedding_batch(texts: list[str]) -> list[list[float] | None]:
         batch_indices = indices[start : start + 512]
 
         try:
-            resp = _call_embed_with_retry(client, {
-                "model": settings.EMBED_MODEL,
-                "input": batch,
-            })
+            resp = _call_embed_with_retry(
+                client,
+                {
+                    "model": settings.EMBED_MODEL,
+                    "input": batch,
+                },
+            )
             if resp is None:
-                logger.warning("Embedding batch failed after retries, falling back to singles")
+                logger.warning(
+                    "Embedding batch failed after retries, falling back to singles"
+                )
                 for idx in batch_indices:
                     results[idx] = _single_embedding(texts[idx])
                 continue
@@ -142,7 +155,8 @@ def get_embedding_batch(texts: list[str]) -> list[list[float] | None]:
         except Exception as e:
             logger.warning(
                 "Batch embedding failed (%d texts): %s, falling back to singles",
-                len(batch), e,
+                len(batch),
+                e,
             )
             for idx in batch_indices:
                 results[idx] = _single_embedding(texts[idx])
@@ -162,10 +176,13 @@ def _single_embedding(text: str) -> list[float] | None:
 
     try:
         client = _get_client()
-        resp = _call_embed_with_retry(client, {
-            "model": settings.EMBED_MODEL,
-            "input": cleaned,
-        })
+        resp = _call_embed_with_retry(
+            client,
+            {
+                "model": settings.EMBED_MODEL,
+                "input": cleaned,
+            },
+        )
         if resp is None:
             return None
         if resp.status_code == 400:

@@ -1,0 +1,19 @@
+# Local source-build overlay. Production setup uses only compose.yaml.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: self-hosted-library:dev
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: self-hosted-library:dev
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: self-hosted-library:dev

@@ -1,7 +1,5 @@
-# Self-hosted library stack — CPU-safe baseline
-# GPU acceleration: add compose.gpu.yaml overlay (auto-detected by setup.sh)
-# restart: unless-stopped => containers return after host reboot
-# healthchecks + depends_on conditions => ordered ready start
+# Production stack: pinned prebuilt application image, private dependencies.
+# Local source builds use: docker compose -f compose.yaml -f compose.dev.yaml ...
 
 networks:
   library:
@@ -11,7 +9,7 @@ volumes:
   qdrant_data:
   postgres_data:
   redis_data:
-  minio_data:
+  seaweedfs_data:
   ollama_data:
 
 x-logging: &default-logging
@@ -23,43 +21,45 @@ x-logging: &default-logging
 x-api-env: &api-env
   DATABASE_URL: ${DATABASE_URL}
   REDIS_URL: ${REDIS_URL}
-  OLLAMA_URL: ${OLLAMA_URL}
-  QDRANT_URL: ${QDRANT_URL}
+  OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+  QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
   QDRANT_COLLECTION: ${QDRANT_COLLECTION:-library_documents}
   IMAGE_COLLECTION: ${IMAGE_COLLECTION:-library_images}
+  IMAGE_SEARCH_MIN_SCORE: ${IMAGE_SEARCH_MIN_SCORE:-0.2}
   EMBED_MODEL: ${EMBED_MODEL:-bge-large}
   EMBED_DIMENSION: ${EMBED_DIMENSION:-1024}
-  MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-  MINIO_BUCKET: ${MINIO_BUCKET:-library-files}
-  MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL}
-  DATA_DIR: ${DATA_DIR:-/app/data}
+  S3_ENDPOINT: ${S3_ENDPOINT:-seaweedfs:8333}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY}
+  S3_BUCKET: ${S3_BUCKET:-library-files}
   EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-512}
   EMBED_BATCH_DELAY: ${EMBED_BATCH_DELAY:-0.0}
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000}
   PYTHONUNBUFFERED: "1"
   PYTHONDONTWRITEBYTECODE: "1"
 
+x-app-image: &app-image
+  image: ghcr.io/porkmagus/self-hosted-library:${APP_VERSION:-v1.0.0}
+  env_file: [.env]
+  environment:
+    <<: *api-env
+  networks: [library]
+  logging: *default-logging
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+
+
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.18.2
     restart: unless-stopped
     logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 5G
-        reservations:
-          memory: 512M
     networks: [library]
-    ports:
-      - "127.0.0.1:6333:6333"
-      - "127.0.0.1:6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
-      - QDRANT__SERVICE__GRPC_PORT=6334
+      QDRANT__SERVICE__GRPC_PORT: "6334"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
       interval: 10s
@@ -68,20 +68,12 @@ services:
       start_period: 15s
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18.4-alpine
     restart: unless-stopped
     logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 64M
     networks: [library]
-    ports:
-      - "127.0.0.1:5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-library}
       POSTGRES_USER: ${POSTGRES_USER:-library}
@@ -94,21 +86,13 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7-alpine
+    image: redis:8.8.0-alpine
     restart: unless-stopped
     logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 32M
     networks: [library]
-    ports:
-      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -116,91 +100,49 @@ services:
       retries: 10
       start_period: 5s
 
-  minio:
-    image: minio/minio:latest
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.39
     restart: unless-stopped
     logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 128M
     networks: [library]
-    ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
     volumes:
-      - minio_data:/data
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    command: minio server /data --console-address ":9001"
+      - seaweedfs_data:/data
+      - ${SEAWEEDFS_S3_CONFIG_PATH:-./.state/seaweedfs-s3.json}:/etc/seaweedfs/s3.json:ro
+    command: ["mini", "-dir=/data", "-s3.config=/etc/seaweedfs/s3.json", "-master.telemetry=false"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD-SHELL", "code=$$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/); [ \"$$code\" = 200 ] || [ \"$$code\" = 403 ]"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 15s
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.12.10
     restart: unless-stopped
     logging: *default-logging
     networks: [library]
-    ports:
-      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     environment:
-      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
-      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-8}
-    deploy:
-      resources:
-        limits:
-          memory: 6G
-        reservations:
-          memory: 512M
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
     healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "ollama", "list"]
       interval: 20s
       timeout: 10s
       retries: 15
       start_period: 30s
 
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: self-hosted-library:local
-    restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-        reservations:
-          memory: 512M
-    networks: [library]
+    <<: *app-image
     ports:
-      - "8000:8000"
-    env_file: [.env]
-    environment:
-      <<: *api-env
-    volumes:
-      - ./data:/app/data:ro
-      - ./models:/app/models:ro
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8000}:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      ollama:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      seaweedfs: {condition: service_healthy}
+      ollama: {condition: service_healthy}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)\""]
       interval: 15s
@@ -209,40 +151,30 @@ services:
       start_period: 40s
 
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: self-hosted-library:local
-    restart: unless-stopped
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 5G
-        reservations:
-          memory: 512M
-    networks: [library]
-    env_file: [.env]
-    environment:
-      <<: *api-env
-    volumes:
-      - ./data:/app/data:ro
-      - ./models:/app/models:ro
-    command: celery -A api.tasks.celery_app worker --loglevel=info --concurrency=8 --pool=prefork
+    <<: *app-image
+    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork"]
     depends_on:
-      redis:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-      ollama:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      seaweedfs: {condition: service_healthy}
+      ollama: {condition: service_healthy}
     healthcheck:
       test: ["CMD-SHELL", "celery -A api.tasks.celery_app inspect ping -d celery@$$HOSTNAME 2>/dev/null | grep -q pong"]
       interval: 30s
       timeout: 15s
       retries: 5
       start_period: 45s
+
+  beat:
+    <<: *app-image
+    command: ["celery", "-A", "api.tasks.celery_app", "beat", "--loglevel=info", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from pathlib import Path; command=Path('/proc/1/cmdline').read_bytes().replace(b'\\0', b' '); assert b'celery' in command and b'beat' in command\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

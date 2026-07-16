@@ -1,9 +1,9 @@
 # Self-Hosted Library API requirements
 
 # Core web framework
-fastapi==0.115.0
+fastapi==0.139.1
 uvicorn[standard]==0.32.0
-python-multipart==0.0.12
+python-multipart==0.0.32
 
 # Database
 sqlalchemy==2.0.35

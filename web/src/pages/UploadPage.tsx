@@ -4,7 +4,7 @@ import { api } from "../lib/api"
 import { formatSize } from "../lib/format"
 import { ErrorBanner } from "../components"
 
-const ACCEPT = ".pdf,.epub,.txt,.md"
+const ACCEPT = ".pdf,.epub,.doc,.docx,.txt,.md,.htm,.html"
 
 export function UploadPage() {
   const [status, setStatus] = useState("")
@@ -25,14 +25,10 @@ export function UploadPage() {
     if (!file || busy) return
     setBusy(true)
     setError(null)
-    setStatus("Requesting upload URL…")
+    setStatus("Uploading securely through the API…")
     setPct(0)
     try {
-      const p = await api.presign(file.name, file.type || "application/octet-stream")
-      setStatus("Uploading to storage…")
-      await api.putFile(p.upload_url, file, setPct)
-      setStatus("Queuing ingestion…")
-      await api.confirmUpload(p.file_id, file.name)
+      await api.uploadFile(file, setPct)
       setStatus(`Queued "${file.name}" for ingestion`)
       setPct(100)
     } catch (e) {

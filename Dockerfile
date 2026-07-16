@@ -20,23 +20,27 @@ WORKDIR /app
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      build-essential \
       curl \
-      libffi-dev \
       libgl1 \
       libglib2.0-0 \
       poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 library \
+    && useradd --uid 10001 --gid library --create-home --shell /usr/sbin/nologin library
 
 COPY api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api/ .
-COPY --from=web-builder /app/web/dist /app/static
+COPY --chown=library:library api/ .
+COPY --chown=library:library --from=web-builder /app/web/dist /app/static
+
+RUN mkdir -p /home/library/.cache && chown -R library:library /home/library /app
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=8s --start-period=40s --retries=5 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)" || exit 1
+
+USER library
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

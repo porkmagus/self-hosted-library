@@ -6,7 +6,9 @@ from os import PathLike
 from pathlib import Path
 
 
-def resolve_under(base_dir: str | PathLike[str], candidate: str | PathLike[str]) -> Path:
+def resolve_under(
+    base_dir: str | PathLike[str], candidate: str | PathLike[str]
+) -> Path:
     """Resolve a relative path and reject escapes outside ``base_dir``."""
     base = Path(base_dir).resolve()
     raw = Path(candidate)

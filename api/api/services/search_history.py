@@ -19,7 +19,9 @@ _MAX_HISTORY = 20
 def _redis() -> Redis[str]:
     global _client
     if _client is None:
-        _client = Redis.from_url(settings.REDIS_URL, decode_responses=True, socket_timeout=1.0)
+        _client = Redis.from_url(
+            settings.REDIS_URL, decode_responses=True, socket_timeout=1.0
+        )
     return _client
 
 

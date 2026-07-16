@@ -1,4 +1,5 @@
 """Small Redis-backed search cache and rate guard."""
+
 from __future__ import annotations
 
 import hashlib
@@ -33,7 +34,9 @@ return excess
 def _redis() -> Redis[str]:
     global _client
     if _client is None:
-        _client = Redis.from_url(settings.REDIS_URL, decode_responses=True, socket_timeout=1.0)
+        _client = Redis.from_url(
+            settings.REDIS_URL, decode_responses=True, socket_timeout=1.0
+        )
     return _client
 
 
@@ -51,8 +54,13 @@ def bump_index_generation() -> None:
         logger.warning("Could not invalidate search cache: %s", exc)
 
 
-def make_search_cache_key(query: str, limit: int, book_id: str | None, rerank: bool, generation: str) -> str:
-    raw = json.dumps([normalize_query(query), limit, book_id or "", rerank, generation], separators=(",", ":"))
+def make_search_cache_key(
+    query: str, limit: int, book_id: str | None, rerank: bool, generation: str
+) -> str:
+    raw = json.dumps(
+        [normalize_query(query), limit, book_id or "", rerank, generation],
+        separators=(",", ":"),
+    )
     return "search:v3:" + hashlib.sha256(raw.encode()).hexdigest()
 
 

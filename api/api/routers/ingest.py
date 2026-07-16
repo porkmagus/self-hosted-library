@@ -14,16 +14,15 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 
 from api.config import settings
-from api.models import Book, BookStatus, get_db_session
+from api.models import Book, BookStatus, IngestionJob, IngestionState, get_db_session
+from api.services.ingestion_jobs import cancel_job
 from api.services.path_svc import resolve_under
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _summarize_counts(
-    counts: Mapping[str, int], qdrant_chunks: int
-) -> dict[str, Any]:
+def _summarize_counts(counts: Mapping[str, int], qdrant_chunks: int) -> dict[str, Any]:
     total = sum(counts.values())
     indexed = counts.get("indexed", 0)
     failed = counts.get("failed", 0)
@@ -50,7 +49,12 @@ def _summarize_counts(
 
 def _get_progress_snapshot() -> dict[str, Any]:
     with get_db_session() as db:
-        rows = db.query(Book.status, func.count(Book.id)).group_by(Book.status).all()
+        rows = (
+            db.query(Book.status, func.count(Book.id))
+            .filter(Book.deleted_at.is_(None))
+            .group_by(Book.status)
+            .all()
+        )
         counts = {row[0].value if row[0] else "none": row[1] for row in rows}
 
     try:
@@ -78,7 +82,7 @@ def list_books(
 ) -> dict[str, Any]:
     """List all books in the library with optional filtering."""
     with get_db_session() as db:
-        q = db.query(Book)
+        q = db.query(Book).filter(Book.deleted_at.is_(None))
 
         if status:
             q = q.filter(Book.status == status)
@@ -122,7 +126,11 @@ def list_books(
 def get_book(book_id: str) -> dict[str, Any]:
     """Get details for a specific book by UUID."""
     with get_db_session() as db:
-        book = db.query(Book).filter(Book.uuid == book_id).first()
+        book = (
+            db.query(Book)
+            .filter(Book.uuid == book_id, Book.deleted_at.is_(None))
+            .first()
+        )
         if not book:
             raise HTTPException(status_code=404, detail="Book not found")
 
@@ -136,8 +144,6 @@ def get_book(book_id: str) -> dict[str, Any]:
             "file_extension": book.file_extension,
             "file_size_bytes": book.file_size_bytes,
             "file_hash": book.file_hash,
-            "minio_object_key": book.minio_object_key,
-            "markdown_path": book.markdown_path,
             "status": book.status.value if book.status else None,
             "total_chunks": book.total_chunks,
             "indexed_chunks": book.indexed_chunks,
@@ -147,69 +153,33 @@ def get_book(book_id: str) -> dict[str, Any]:
         }
 
 
-@router.delete("/books/{book_id}")
+@router.delete("/books/{book_id}", status_code=202)
 def delete_book(book_id: str) -> dict[str, Any]:
-    """Delete a book: remove from Qdrant, MinIO, filesystem, and database."""
-    from api.config import settings as cfg
-    from api.services.minio_svc import get_minio_client
-    from api.services.qdrant_svc import get_qdrant_client
+    """Fence active workers, soft-delete metadata, and queue idempotent cleanup."""
+    from api.services.ingestion_outbox import create_book_event
 
     with get_db_session() as db:
-        book = db.query(Book).filter(Book.uuid == book_id).first()
-        if not book:
+        book = db.query(Book).filter(Book.uuid == book_id).with_for_update().first()
+        if not book or book.deleted_at is not None:
             raise HTTPException(status_code=404, detail="Book not found")
-
-        deleted_chunks = 0
-        deleted_minio = False
-        deleted_file = False
-        deleted_markdown = False
-
-        # 1. Delete from Qdrant
-        try:
-            qdrant = get_qdrant_client()
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
-            result = qdrant.delete(
-                collection_name=cfg.QDRANT_COLLECTION,
-                points_selector=Filter(
-                    must=[FieldCondition(key="book_id", match=MatchValue(value=book_id))]
-                ),
-            )
-            deleted_chunks = getattr(result, "deleted", 0) or 0
-            logger.info("Deleted %d Qdrant points for book %s", deleted_chunks, book_id)
-        except Exception as exc:
-            logger.warning("Failed to delete Qdrant points for %s: %s", book_id, exc)
-
-        # 2. Delete from MinIO
-        if book.minio_object_key:
-            try:
-                minio = get_minio_client()
-                minio.remove_object(cfg.MINIO_BUCKET, book.minio_object_key)
-                deleted_minio = True
-                logger.info("Deleted MinIO object %s for book %s", book.minio_object_key, book_id)
-            except Exception as exc:
-                logger.warning("Failed to delete MinIO object for %s: %s", book_id, exc)
-
-        # 3. Delete markdown file
-        if book.markdown_path:
-            md_path = Path(book.markdown_path)
-            if md_path.exists():
-                try:
-                    md_path.unlink()
-                    deleted_markdown = True
-                except Exception as exc:
-                    logger.warning("Failed to delete markdown %s: %s", md_path, exc)
-
-        # 4. Delete from database
-        db.delete(book)
+        now = db.query(func.now()).scalar()
+        book.processing_generation += 1
+        book.deleted_at = now
+        book.status = BookStatus.DELETED
+        jobs = db.query(IngestionJob).filter(IngestionJob.book_id == book.id).all()
+        for job in jobs:
+            if job.state not in {
+                IngestionState.SUCCEEDED,
+                IngestionState.FAILED,
+                IngestionState.CANCELLED,
+            }:
+                cancel_job(db, job.uuid)
+        create_book_event(db, book.uuid, "cleanup_book")
         db.commit()
-
         return {
             "deleted": True,
             "book_id": book_id,
-            "qdrant_chunks": deleted_chunks,
-            "minio_deleted": deleted_minio,
-            "file_deleted": deleted_file,
-            "markdown_deleted": deleted_markdown,
+            "status": "cleanup_queued",
         }
 
 
@@ -228,12 +198,20 @@ def get_ingest_progress(task_id: str) -> dict[str, Any]:
 def get_ingest_books(task_id: str) -> dict[str, Any]:
     """Get individual book ingestion status for live progress tracking."""
     with get_db_session() as db:
-        books = db.query(Book).filter(
-            Book.status.in_([
-                BookStatus.EXTRACTING, BookStatus.CHUNKING,
-                BookStatus.EMBEDDING, BookStatus.PENDING,
-            ])
-        ).all()
+        books = (
+            db.query(Book)
+            .filter(
+                Book.status.in_(
+                    [
+                        BookStatus.EXTRACTING,
+                        BookStatus.CHUNKING,
+                        BookStatus.EMBEDDING,
+                        BookStatus.PENDING,
+                    ]
+                )
+            )
+            .all()
+        )
         active = [
             {
                 "uuid": b.uuid,
@@ -241,7 +219,9 @@ def get_ingest_books(task_id: str) -> dict[str, Any]:
                 "status": b.status.value if b.status else "unknown",
                 "total_chunks": b.total_chunks,
                 "indexed_chunks": b.indexed_chunks,
-                "progress": round(b.indexed_chunks / b.total_chunks * 100, 1) if b.total_chunks else 0,
+                "progress": round(b.indexed_chunks / b.total_chunks * 100, 1)
+                if b.total_chunks
+                else 0,
             }
             for b in books
         ]
@@ -334,8 +314,14 @@ def ingest_local_books(
             )
 
         supported_exts = {
-            ".pdf", ".epub", ".docx", ".doc",
-            ".txt", ".md", ".htm", ".html",
+            ".pdf",
+            ".epub",
+            ".docx",
+            ".doc",
+            ".txt",
+            ".md",
+            ".htm",
+            ".html",
         }
         book_paths = [
             str(f)

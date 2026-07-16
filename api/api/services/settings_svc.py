@@ -14,20 +14,20 @@ ALLOWED_KEYS = {"app_name", "app_subtitle", "accent_color"}
 def init_settings_table() -> None:
     """Create settings table and seed defaults if empty."""
     with get_db_session() as session:
-        session.execute(text("""
+        session.execute(
+            text("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key   VARCHAR(64) PRIMARY KEY,
                 value TEXT NOT NULL
             )
-        """))
+        """)
+        )
         defaults = [
             ("app_name", "Self-Hosted Library"),
             ("app_subtitle", "Private document search and research"),
             ("accent_color", "#D4AF57"),
         ]
-        existing = session.execute(
-            text("SELECT COUNT(*) FROM app_settings")
-        ).scalar()
+        existing = session.execute(text("SELECT COUNT(*) FROM app_settings")).scalar()
         if (existing or 0) == 0:
             for k, v in defaults:
                 session.execute(
@@ -40,9 +40,7 @@ def init_settings_table() -> None:
 def get_all_settings() -> dict[str, str]:
     global _app_settings
     with get_db_session() as session:
-        rows = session.execute(
-            text("SELECT key, value FROM app_settings")
-        ).fetchall()
+        rows = session.execute(text("SELECT key, value FROM app_settings")).fetchall()
         _app_settings = {row[0]: row[1] for row in rows}
     return _app_settings or {}
 

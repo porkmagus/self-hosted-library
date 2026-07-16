@@ -10,7 +10,9 @@ def test_resolve_under_returns_resolved_child(tmp_path: Path) -> None:
     assert child == (tmp_path / "folder/book.pdf").resolve()
 
 
-@pytest.mark.parametrize("candidate", ["../secret", "folder/../../secret", "/etc/passwd"])
+@pytest.mark.parametrize(
+    "candidate", ["../secret", "folder/../../secret", "/etc/passwd"]
+)
 def test_resolve_under_rejects_paths_outside_base(
     tmp_path: Path, candidate: str
 ) -> None:
@@ -25,7 +27,10 @@ def test_resolve_under_rejects_sibling_prefix_attack(tmp_path: Path) -> None:
         resolve_under(base, sibling)
 
 
-@pytest.mark.parametrize("filename", ["", ".", "..", "folder/book.pdf", "folder\\book.pdf", "bad\x00name.pdf"])
+@pytest.mark.parametrize(
+    "filename",
+    ["", ".", "..", "folder/book.pdf", "folder\\book.pdf", "bad\x00name.pdf"],
+)
 def test_validate_filename_rejects_unsafe_names(filename: str) -> None:
     with pytest.raises(ValueError, match="filename"):
         validate_filename(filename)

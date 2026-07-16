@@ -4,7 +4,9 @@ from pydantic import ValidationError
 from api.routers.upload import UploadRequest
 
 
-@pytest.mark.parametrize("filename", ["", "../book.pdf", "folder/book.pdf", "folder\\book.pdf"])
+@pytest.mark.parametrize(
+    "filename", ["", "../book.pdf", "folder/book.pdf", "folder\\book.pdf"]
+)
 def test_upload_request_rejects_path_like_filenames(filename: str) -> None:
     with pytest.raises(ValidationError):
         UploadRequest(filename=filename)
