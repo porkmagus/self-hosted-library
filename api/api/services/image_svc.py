@@ -34,7 +34,7 @@ def _load_clip() -> tuple[Any | None, Any | None]:
         logger.info("Loading CLIP model from %s", model_path)
         _CLIP_MODEL = CLIPModel.from_pretrained(model_path)
         _CLIP_PROCESSOR = CLIPProcessor.from_pretrained(model_path)
-        _CLIP_MODEL.eval()
+        _CLIP_MODEL.eval()  # type: ignore[no-untyped-call]
         logger.info("CLIP model loaded")
         return _CLIP_MODEL, _CLIP_PROCESSOR
     except Exception as e:
