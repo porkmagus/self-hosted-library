@@ -1,96 +1,119 @@
-"""Upload router — presigned URLs for direct browser-to-MinIO uploads."""
+"""Private API-mediated source upload and download endpoints."""
 
 from __future__ import annotations
 
-import uuid
-from typing import Any
+import tempfile
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, field_validator
+from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
+from starlette.responses import FileResponse
 
-from api.config import settings
-from api.models import Book, BookStatus, get_db_session
-from api.services.minio_svc import ensure_bucket, get_presigned_upload_url
+from api.models import Book, get_db
+from api.services.ingestion_submit import submit_uploaded_book
+from api.services.object_store import get_object_store
 from api.services.path_svc import validate_filename
 
-router = APIRouter()
+router = APIRouter(prefix="/upload")
+SUPPORTED_EXTENSIONS = {
+    ".pdf",
+    ".epub",
+    ".docx",
+    ".doc",
+    ".txt",
+    ".md",
+    ".htm",
+    ".html",
+}
+
+
+class UploadResponse(BaseModel):
+    book_uuid: str
+    job_uuid: str
+    task_id: str
+    status: str
 
 
 class UploadRequest(BaseModel):
+    """Compatibility schema retaining strict plain-filename validation."""
+
     filename: str
     content_type: str = "application/octet-stream"
 
     @field_validator("filename")
     @classmethod
-    def filename_must_be_plain(cls, value: str) -> str:
+    def filename_is_plain(cls, value: str) -> str:
         return validate_filename(value)
 
 
-class UploadResponse(BaseModel):
-    upload_url: str
-    object_key: str
-    file_id: str
-
-
-@router.post("/upload/presign")
-def get_presigned_url(req: UploadRequest) -> UploadResponse:
-    """Get a presigned URL for direct browser upload to MinIO."""
-    ensure_bucket()
-
-    file_id = str(uuid.uuid4())
-    object_key = f"{file_id}_{req.filename}"
-
-    upload_url = get_presigned_upload_url(object_key, expires_seconds=3600)
-
+@router.post("", response_model=UploadResponse, status_code=202)
+def upload_source(
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    author: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+) -> UploadResponse:
+    """Spool multipart input, then stream it into private durable object storage."""
+    filename = file.filename or ""
+    extension = Path(filename).suffix.lower()
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported file type: {extension}"
+        )
+    try:
+        result = submit_uploaded_book(
+            db,
+            filename=filename,
+            content_type=file.content_type or "application/octet-stream",
+            stream=file.file,
+            store=get_object_store(),
+            title=title.strip() if title and title.strip() else None,
+            author=author.strip() if author and author.strip() else None,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Upload could not be persisted"
+        ) from exc
     return UploadResponse(
-        upload_url=upload_url,
-        object_key=object_key,
-        file_id=file_id,
+        book_uuid=result.book_uuid,
+        job_uuid=result.job_uuid,
+        task_id=result.task_id,
+        status="queued",
     )
 
 
-@router.post("/upload/confirm")
-def confirm_upload(file_id: str, filename: str) -> dict[str, Any]:
-    """Called by the frontend after upload completes to trigger ingestion."""
+@router.get("/{book_uuid}/source")
+def download_source(book_uuid: str, db: Session = Depends(get_db)) -> FileResponse:
+    """Stream a private source through the API without exposing S3 credentials."""
+    book = (
+        db.query(Book).filter(Book.uuid == book_uuid, Book.deleted_at.is_(None)).first()
+    )
+    if book is None or not book.source_object_key:
+        raise HTTPException(status_code=404, detail="Book source not found")
+    store = get_object_store()
+    if not store.exists(book.source_object_key):
+        raise HTTPException(status_code=404, detail="Book source object not found")
 
-    from api.services.minio_svc import get_minio_client
-    from api.tasks.celery_app import ingest_book_task
-
+    with tempfile.NamedTemporaryFile(
+        prefix="grimoire-download-", delete=False
+    ) as temporary:
+        path = Path(temporary.name)
     try:
-        filename = validate_filename(filename)
-        file_id = str(uuid.UUID(file_id))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    client = get_minio_client()
-    object_key = f"{file_id}_{filename}"
-    try:
-        client.stat_object(settings.MINIO_BUCKET, object_key)
-    except Exception:
+        store.download_to(book.source_object_key, path)
+    except Exception as exc:
+        path.unlink(missing_ok=True)
         raise HTTPException(
-            status_code=404, detail=f"File {filename} not found in MinIO"
-        ) from None
-
-    with get_db_session() as db:
-        book_uuid = str(uuid.uuid4())
-        book = Book(
-            uuid=book_uuid,
-            title=filename.replace(".", " ").title(),
-            original_filename=filename,
-            sanitized_filename=filename[:150],
-            file_extension=filename.rsplit(".", 1)[-1]
-            if "." in filename
-            else "unknown",
-            minio_object_key=object_key,
-            status=BookStatus.PENDING,
-        )
-        db.add(book)
-        db.commit()
-
-        task = ingest_book_task.delay(object_key)
-
-        return {
-            "book_id": book_uuid,
-            "task_id": task.id,
-            "status": "queued",
-        }
+            status_code=503, detail="Book source is unavailable"
+        ) from exc
+    return FileResponse(
+        path,
+        filename=book.original_filename,
+        media_type="application/octet-stream",
+        background=BackgroundTask(path.unlink, missing_ok=True),
+    )

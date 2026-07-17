@@ -14,6 +14,12 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+@router.get("/health/live")
+async def liveness_check() -> dict[str, str]:
+    """Process liveness probe; deliberately independent of external services."""
+    return {"status": "ok", "version": "2.0.0"}
+
+
 @router.get("/health")
 async def health_check() -> dict[str, Any]:
     """Health endpoint — checks all service dependencies."""
@@ -62,14 +68,14 @@ async def health_check() -> dict[str, Any]:
         errors.append("PostgreSQL unreachable")
 
     try:
-        from api.services.minio_svc import get_minio_client
+        from api.services.object_store import get_object_store
 
-        minio_client = get_minio_client()
-        minio_client.bucket_exists(settings.MINIO_BUCKET)
-        status["minio"] = "ok"
+        if not get_object_store().bucket_exists():
+            raise RuntimeError("configured object-store bucket is missing")
+        status["object_store"] = "ok"
     except Exception:
-        status["minio"] = "unreachable"
-        errors.append("MinIO unreachable")
+        status["object_store"] = "unreachable"
+        errors.append("Object storage unreachable")
 
     status["warnings"] = errors
     return status

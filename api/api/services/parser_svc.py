@@ -19,6 +19,7 @@ from api.services.search_utils import normalize_display_text
 
 logger = logging.getLogger(__name__)
 
+
 # Filename sanitization
 def sanitize_filename(name: str) -> str:
     """Clean up bibliographic filenames while preserving readability."""
@@ -56,9 +57,7 @@ def extract_pdf_pymupdf(pdf_path: Path) -> str:
     return "\n\n".join(text_parts)
 
 
-def _build_marker_wrapper(
-    marker_src: Path, pdf_path: Path, output_dir: Path
-) -> str:
+def _build_marker_wrapper(marker_src: Path, pdf_path: Path, output_dir: Path) -> str:
     """Build the standalone Marker runner without shell interpolation."""
     return (
         "import os\n"
@@ -137,7 +136,9 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
         wrapper_path.unlink(missing_ok=True)
 
     if result.returncode != 0 or "MARKER_SUCCESS" not in result.stdout:
-        logger.warning("Marker failed: stdout=%s stderr=%s", result.stdout, result.stderr)
+        logger.warning(
+            "Marker failed: stdout=%s stderr=%s", result.stdout, result.stderr
+        )
         return None
 
     # Marker creates: output_dir/{stem}/{stem}.md

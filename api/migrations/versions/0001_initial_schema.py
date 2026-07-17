@@ -6,16 +6,17 @@ Create Date: 2026-07-12
 
 """
 
-from typing import Sequence, Union
+from __future__ import annotations
 
-from alembic import op
+from collections.abc import Sequence
+
 import sqlalchemy as sa
-
+from alembic import op
 
 revision: str = "0001"
-down_revision: Union[str, None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -35,8 +36,13 @@ def upgrade() -> None:
         sa.Column(
             "status",
             sa.Enum(
-                "pending", "uploading", "extracting", "chunking",
-                "embedding", "indexed", "failed",
+                "pending",
+                "uploading",
+                "extracting",
+                "chunking",
+                "embedding",
+                "indexed",
+                "failed",
                 name="bookstatus",
             ),
             nullable=False,
@@ -53,12 +59,19 @@ def upgrade() -> None:
         "ingestion_jobs",
         sa.Column("id", sa.Integer(), primary_key=True, index=True),
         sa.Column("book_id", sa.Integer(), nullable=True),
-        sa.Column("celery_task_id", sa.String(36), unique=True, index=True, nullable=False),
+        sa.Column(
+            "celery_task_id", sa.String(36), unique=True, index=True, nullable=False
+        ),
         sa.Column(
             "status",
             sa.Enum(
-                "pending", "uploading", "extracting", "chunking",
-                "embedding", "indexed", "failed",
+                "pending",
+                "uploading",
+                "extracting",
+                "chunking",
+                "embedding",
+                "indexed",
+                "failed",
                 name="bookstatus",
             ),
             nullable=False,

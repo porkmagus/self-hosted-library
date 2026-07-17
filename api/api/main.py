@@ -29,6 +29,17 @@ from api.routers import (
 )
 
 logger = logging.getLogger(__name__)
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    ),
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 
 @asynccontextmanager
@@ -46,21 +57,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def _init_minio_bucket() -> None:
     from api.services.minio_svc import ensure_bucket
+
     ensure_bucket()
 
 
 def _init_qdrant_collection() -> None:
     from api.services.qdrant_svc import init_collection
+
     init_collection()
 
 
 def _init_image_collection() -> None:
     from api.services.image_svc import init_image_collection
+
     init_image_collection()
 
 
 def _init_settings() -> None:
     from api.services.settings_svc import init_settings_table
+
     init_settings_table()
 
 
@@ -74,10 +89,18 @@ app = FastAPI(
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next: Any) -> Any:
-    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    supplied_request_id = request.headers.get("X-Request-ID", "")
+    request_id = (
+        supplied_request_id
+        if 1 <= len(supplied_request_id) <= 64
+        and supplied_request_id.replace("-", "").replace("_", "").isalnum()
+        else uuid.uuid4().hex[:12]
+    )
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
+    for name, value in SECURITY_HEADERS.items():
+        response.headers[name] = value
     return response
 
 
@@ -130,7 +153,9 @@ app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 if STATIC_DIR.is_dir():
-    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
+    app.mount(
+        "/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets"
+    )
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str) -> FileResponse:

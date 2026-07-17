@@ -122,9 +122,11 @@ export interface IngestProgress {
   error?: string
 }
 
-export interface PresignResponse {
-  file_id: string
-  upload_url: string
+export interface UploadResponse {
+  book_uuid: string
+  job_uuid: string
+  task_id: string
+  status: string
 }
 
 export interface LocalIngestResponse {

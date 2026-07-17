@@ -64,7 +64,9 @@ async def _get_context(req: ContextRequest) -> dict[str, Any]:
         if pts:
             matched_chunk = pts[0]
     except Exception:
-        logger.warning("Failed to retrieve chunk %s for book %s", req.chunk_id, req.book_id)
+        logger.warning(
+            "Failed to retrieve chunk %s for book %s", req.chunk_id, req.book_id
+        )
 
     page_min = max(0, req.page_number - req.pages_before)
     page_max = req.page_number + req.pages_after

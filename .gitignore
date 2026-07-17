@@ -17,3 +17,5 @@ models/
 qdrant_storage/
 *.bak
 *.log
+.state/
+backups/

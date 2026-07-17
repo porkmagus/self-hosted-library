@@ -8,4 +8,6 @@ def test_cache_key_is_stable_for_equivalent_queries() -> None:
 
 
 def test_cache_key_changes_with_generation() -> None:
-    assert make_search_cache_key("magic", 20, None, True, "1") != make_search_cache_key("magic", 20, None, True, "2")
+    assert make_search_cache_key("magic", 20, None, True, "1") != make_search_cache_key(
+        "magic", 20, None, True, "2"
+    )

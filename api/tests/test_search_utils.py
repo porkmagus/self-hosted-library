@@ -22,7 +22,10 @@ def test_character_per_line_ocr_is_rejoined() -> None:
 
 def test_hard_wrapped_prose_is_rejoined_but_paragraphs_survive() -> None:
     text = "This is a line that was wrapped by PDF extraction at the same column\nbefore the sentence ended and continued with several ordinary prose words\nwhile another continuation line supplies enough evidence for hard wrapping\nand the final line closes the paragraph normally.\n\nA second paragraph remains."
-    assert normalize_display_text(text) == "This is a line that was wrapped by PDF extraction at the same column before the sentence ended and continued with several ordinary prose words while another continuation line supplies enough evidence for hard wrapping and the final line closes the paragraph normally.\n\nA second paragraph remains."
+    assert (
+        normalize_display_text(text)
+        == "This is a line that was wrapped by PDF extraction at the same column before the sentence ended and continued with several ordinary prose words while another continuation line supplies enough evidence for hard wrapping and the final line closes the paragraph normally.\n\nA second paragraph remains."
+    )
 
 
 def test_lists_are_preserved() -> None:
@@ -41,8 +44,18 @@ def test_diversify_limits_consecutive_results_per_book() -> None:
 
 def test_diversify_removes_duplicate_excerpt_across_pages() -> None:
     results = [
-        {"chunk_id": "1", "book_id": "a", "page_number": 1, "text": "The same extracted passage appears here in full."},
-        {"chunk_id": "2", "book_id": "a", "page_number": 2, "text": "The same extracted passage appears here in full."},
+        {
+            "chunk_id": "1",
+            "book_id": "a",
+            "page_number": 1,
+            "text": "The same extracted passage appears here in full.",
+        },
+        {
+            "chunk_id": "2",
+            "book_id": "a",
+            "page_number": 2,
+            "text": "The same extracted passage appears here in full.",
+        },
     ]
     assert [r["chunk_id"] for r in diversify_results(results)] == ["1"]
 

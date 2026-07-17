@@ -8,9 +8,9 @@ from typing import Any
 from urllib.parse import quote
 
 from minio import Minio
-from minio.error import S3Error
 
 from api.config import settings
+from api.services.object_store import get_object_store
 
 _client: Minio | None = None
 
@@ -38,12 +38,7 @@ def get_minio_client() -> Minio:
 
 def ensure_bucket() -> None:
     """Create the books bucket if it doesn't exist."""
-    client = get_minio_client()
-    try:
-        if not client.bucket_exists(settings.MINIO_BUCKET):
-            client.make_bucket(settings.MINIO_BUCKET)
-    except S3Error as e:
-        print(f"MinIO bucket error: {e}")
+    get_object_store().ensure_bucket()
 
 
 def get_presigned_upload_url(object_name: str, expires_seconds: int = 3600) -> str:
@@ -71,21 +66,18 @@ def upload_object(
     data: bytes,
     content_type: str = "application/octet-stream",
 ) -> None:
-    """Upload bytes to MinIO (for internal/worker use)."""
-    client = get_minio_client()
-    client.put_object(
-        bucket_name=settings.MINIO_BUCKET,
-        object_name=object_name,
-        data=io.BytesIO(data),
+    """Compatibility wrapper for internal object-store uploads."""
+    get_object_store().upload_stream(
+        object_name,
+        io.BytesIO(data),
         length=len(data),
         content_type=content_type,
     )
 
 
 def stat_object(object_name: str) -> dict[str, Any]:
-    """Get object metadata from MinIO."""
-    client = get_minio_client()
-    stat = client.stat_object(settings.MINIO_BUCKET, object_name)
+    """Compatibility wrapper for private object metadata."""
+    stat = get_object_store().stat(object_name)
     return {
         "size": stat.size,
         "etag": stat.etag,
