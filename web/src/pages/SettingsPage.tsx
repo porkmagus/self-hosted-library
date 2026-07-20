@@ -17,12 +17,16 @@ export function SettingsPage() {
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
-    const data = (await apiGet("/settings")) as Record<string, string>
-    setSettings({
-      app_name: data.app_name ?? DEFAULTS.app_name,
-      app_subtitle: data.app_subtitle ?? DEFAULTS.app_subtitle,
-      accent_color: data.accent_color ?? DEFAULTS.accent_color,
-    })
+    try {
+      const data = (await apiGet("/settings")) as Record<string, string>
+      setSettings({
+        app_name: data.app_name ?? DEFAULTS.app_name,
+        app_subtitle: data.app_subtitle ?? DEFAULTS.app_subtitle,
+        accent_color: data.accent_color ?? DEFAULTS.accent_color,
+      })
+    } catch {
+      // keep defaults if backend is unavailable
+    }
   }, [])
 
   useEffect(() => { load() }, [load])
@@ -44,8 +48,8 @@ export function SettingsPage() {
       setToast("Settings saved")
       window.dispatchEvent(new CustomEvent("settings-updated"))
       setTimeout(() => setToast(null), 2500)
-    } catch (e: any) {
-      setError(e.message || "Save failed")
+    } catch (e) {
+      setError((e instanceof Error && e.message) || "Save failed")
     } finally {
       setSaving(false)
     }

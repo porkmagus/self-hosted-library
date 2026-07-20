@@ -7,6 +7,7 @@ from datetime import timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from api.models import IngestionOutbox, OutboxState
@@ -103,7 +104,7 @@ def claim_dispatch_events(
 
 def mark_published(session: Session, event_uuid: str, *, task_id: str) -> bool:
     now = session.execute(select(func.now())).scalar_one()
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionOutbox)
         .where(
             IngestionOutbox.uuid == event_uuid,
@@ -137,7 +138,7 @@ def mark_publish_failed(
     now = session.execute(select(func.now())).scalar_one()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionOutbox)
         .where(
             IngestionOutbox.uuid == event_uuid,

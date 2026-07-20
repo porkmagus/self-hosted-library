@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from api.models import IngestionJob, IngestionStage, IngestionState
@@ -139,7 +140,7 @@ def renew_lease(
 ) -> datetime:
     current = _db_now(session, now)
     expires = current + timedelta(seconds=lease_seconds)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(
@@ -171,7 +172,7 @@ def record_artifacts(
 ) -> None:
     current = _db_now(session, now)
     expires = current + timedelta(seconds=lease_seconds)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(
@@ -298,7 +299,7 @@ def complete_job(
     now: datetime | None = None,
 ) -> None:
     current = _db_now(session, now)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(
@@ -340,7 +341,7 @@ def release_for_retry(
     now: datetime | None = None,
 ) -> None:
     current = _db_now(session, now)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(
@@ -379,7 +380,7 @@ def fail_job(
     now: datetime | None = None,
 ) -> None:
     current = _db_now(session, now)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(
@@ -416,7 +417,7 @@ def cancel_job(
 ) -> bool:
     """Fence active workers and request reconciled cancellation."""
     current = _db_now(session, now)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(
@@ -447,7 +448,7 @@ def finalize_cancel(
     session: Session, job_uuid: str, *, now: datetime | None = None
 ) -> bool:
     current = _db_now(session, now)
-    result = session.execute(
+    result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionJob)
         .execution_options(synchronize_session=False)
         .where(

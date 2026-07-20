@@ -137,6 +137,8 @@ export const api = {
     return await new Promise<UploadResponse>((resolve, reject) => {
       const xhr = new XMLHttpRequest()
       xhr.open("POST", `${API}/upload`)
+      xhr.timeout = 300_000 // 5 min
+      xhr.ontimeout = () => reject(new Error("Upload timed out"))
       xhr.upload.onprogress = (ev) => {
         if (ev.lengthComputable && onProgress) {
           onProgress(Math.round((ev.loaded / ev.total) * 100))

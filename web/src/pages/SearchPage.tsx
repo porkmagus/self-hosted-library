@@ -264,9 +264,9 @@ export function SearchPage() {
           <div style={{ padding: "8px 14px", fontSize: 11, color: C.textMuted, letterSpacing: 0.08 }}>
             RECENT SEARCHES
           </div>
-          {searchHistory.map((h, i) => (
+          {searchHistory.map((h) => (
             <button
-              key={i}
+              key={h.query}
               type="button"
               style={{
                 display: "block", width: "100%", textAlign: "left", padding: "8px 14px",
@@ -434,13 +434,16 @@ export function SearchPage() {
 
       {!loading && viewMode === "grid" && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 14 }}>
-          {results.map(r => (
-            <div key={r.chunk_id} className="card" style={{ breakInside: "avoid", marginBottom: 14, cursor: "pointer" }} onClick={() => toggleExpand(r)}>
-              <div style={{ color: C.gold, fontSize: 13, marginBottom: 8, fontFamily: "var(--font-display)" }}>{r.book_title}</div>
-              <div className="text-wrap" style={{ color: C.textDim, fontSize: 13, lineHeight: 1.6 }}>{normalizeDisplayText(r.text).slice(0, 280)}{normalizeDisplayText(r.text).length > 280 ? "…" : ""}</div>
-              <div className="muted" style={{ marginTop: 8 }}>sec.{r.page_number} · {r.score.toFixed(3)}</div>
-            </div>
-          ))}
+          {results.map(r => {
+            const normalized = normalizeDisplayText(r.text)
+            return (
+              <div key={r.chunk_id} className="card" style={{ breakInside: "avoid", marginBottom: 14, cursor: "pointer" }} onClick={() => toggleExpand(r)}>
+                <div style={{ color: C.gold, fontSize: 13, marginBottom: 8, fontFamily: "var(--font-display)" }}>{r.book_title}</div>
+                <div className="text-wrap" style={{ color: C.textDim, fontSize: 13, lineHeight: 1.6 }}>{normalized.slice(0, 280)}{normalized.length > 280 ? "…" : ""}</div>
+                <div className="muted" style={{ marginTop: 8 }}>sec.{r.page_number} · {r.score.toFixed(3)}</div>
+              </div>
+            )
+          })}
         </div>
       )}
 

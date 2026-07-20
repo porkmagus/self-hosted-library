@@ -45,11 +45,19 @@ export function AudioPlayer({ track, onClose }: { track: AudioPlayerState; onClo
     return () => window.removeEventListener("keydown", onKey)
   }, [])
 
-  const toggle = () => {
+  const toggle = async () => {
     if (!audioRef.current) return
-    if (isPlaying) audioRef.current.pause()
-    else void audioRef.current.play()
-    setIsPlaying(!isPlaying)
+    if (isPlaying) {
+      audioRef.current.pause()
+      setIsPlaying(false)
+    } else {
+      try {
+        await audioRef.current.play()
+        setIsPlaying(true)
+      } catch {
+        /* autoplay blocked or playback error */
+      }
+    }
   }
 
   const seek = (e: React.MouseEvent<HTMLDivElement>) => {

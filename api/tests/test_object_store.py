@@ -159,6 +159,7 @@ def test_iter_keys_lists_private_prefix_recursively() -> None:
 
 def test_exists_returns_false_only_for_missing_objects() -> None:
     missing = S3Error(
+        None,
         "NoSuchKey",
         "missing",
         "books/book-1/source.pdf",
