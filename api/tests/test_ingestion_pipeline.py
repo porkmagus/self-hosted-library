@@ -18,6 +18,7 @@ from api.models import (
     IngestionState,
 )
 from api.services.ingestion_jobs import JobLease, release_for_retry
+from api.services.ingestion_activation import derive_expected_vector_points
 from api.services.ingestion_pipeline import PipelineDependencies, run_ingestion_pipeline
 
 
@@ -284,3 +285,77 @@ def test_pdf_pipeline_persists_and_checkpoints_image_manifest(monkeypatch) -> No
         assert job.image_manifest_key in store.objects
         assert book.total_images == 1
         assert book.indexed_images == 1
+
+
+def test_standalone_image_commits_empty_text_identity_for_activation() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    @contextmanager
+    def sessions():
+        with factory() as session:
+            yield session
+
+    source = b"standalone-image-payload"
+    book_uuid = "66666666-6666-6666-6666-666666666666"
+    job_uuid = "77777777-7777-7777-7777-777777777777"
+    with factory() as session:
+        book = Book(
+            uuid=book_uuid,
+            title="Standalone",
+            original_filename="image.bmp",
+            sanitized_filename="image.bmp",
+            file_extension=".bmp",
+            file_hash=hashlib.sha256(source).hexdigest(),
+            source_object_key="books/standalone/source.bmp",
+            status=BookStatus.PENDING,
+        )
+        session.add(book)
+        session.flush()
+        session.add(
+            IngestionJob(
+                uuid=job_uuid,
+                book_id=book.id,
+                generation=1,
+                state=IngestionState.PENDING,
+                stage=IngestionStage.SOURCE_READY,
+                source_hash=book.file_hash,
+                embedding_model="embed-model",
+                embedding_dimension=2,
+                embedding_signature="embed-model|dim=2|normalize=provider",
+            )
+        )
+        session.commit()
+
+    store = MemoryStore({"books/standalone/source.bmp": source})
+    deps = PipelineDependencies(
+        sessions=sessions,
+        store=store,
+        extract=lambda *_: pytest.fail("standalone images must not use text extraction"),
+        chunk=lambda _: pytest.fail("standalone images must not use text chunking"),
+        embed_vectors=lambda _: [],
+        upsert=lambda chunks, **_: len(chunks),
+        extract_images=lambda *_: [],
+        embed_image=lambda _: [0.3, 0.4],
+        index_image=lambda value, _vector, **_: value["image_id"],
+    )
+
+    result = run_ingestion_pipeline(job_uuid, "worker-image", dependencies=deps)
+
+    assert result["indexed_chunks"] == 0
+    assert result["indexed_images"] == 1
+    with factory() as session:
+        job = session.query(IngestionJob).one()
+        assert job.chunk_manifest_key in store.objects
+        assert job.chunk_manifest_sha256 == hashlib.sha256(
+            store.objects[job.chunk_manifest_key]
+        ).hexdigest()
+        text_points, image_points = derive_expected_vector_points(
+            job,
+            book_uuid,
+            store.objects[job.chunk_manifest_key],
+            store.objects[job.image_manifest_key],
+        )
+        assert text_points == []
+        assert len(image_points) == 1

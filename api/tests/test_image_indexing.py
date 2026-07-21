@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+from qdrant_client.models import Distance, VectorParams
+
 from api.services import image_svc
 from api.services.image_svc import (
     build_image_point_id,
@@ -97,7 +99,16 @@ def test_existing_image_collection_gets_generation_visibility_indexes(
             return SimpleNamespace(collections=[SimpleNamespace(name="library_images")])
 
         def get_collection(self, _name):
-            return SimpleNamespace(payload_schema={})
+            return SimpleNamespace(
+                payload_schema={},
+                config=SimpleNamespace(
+                    params=SimpleNamespace(
+                        vectors={
+                            "image": VectorParams(size=512, distance=Distance.COSINE)
+                        }
+                    )
+                ),
+            )
 
         def create_payload_index(
             self, collection_name, field_name, field_schema, wait=True

@@ -17,6 +17,7 @@ def test_infrastructure_images_are_maintained_and_pinned() -> None:
     assert services["qdrant"]["image"] == "qdrant/qdrant:v1.18.2"
     assert services["seaweedfs"]["image"] == "chrislusf/seaweedfs:4.39"
     assert services["ollama"]["image"] == "ollama/ollama:0.12.10"
+    assert services["ollama"]["profiles"] == ["ollama"]
 
 
 def test_single_node_storage_is_one_private_weed_mini_service() -> None:
@@ -74,6 +75,20 @@ def test_app_and_worker_use_neutral_private_s3_configuration() -> None:
         depends_on = compose["services"][service_name]["depends_on"]
         assert depends_on["seaweedfs"]["condition"] == "service_healthy"
         assert "minio" not in depends_on
+
+
+def test_ingestion_and_lifecycle_workers_do_not_share_job_queue() -> None:
+    services = _compose()["services"]
+    worker_command = services["worker"]["command"]
+    lifecycle_command = services["worker_high"]["command"]
+
+    assert "--queues=ingestion,celery" in worker_command
+    assert "--queues=high" in lifecycle_command
+    assert "--queues=high,celery" not in worker_command
+
+    celery_source = (ROOT / "api" / "api" / "tasks" / "celery_app.py").read_text()
+    assert '"ingest.job": {"queue": "ingestion"}' in celery_source
+    assert '"ingest.activate": {"queue": "high"}' in celery_source
 
 
 def test_example_environment_uses_neutral_s3_names() -> None:

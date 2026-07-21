@@ -38,6 +38,17 @@ _CLIP_MODEL: Any | None = None
 _CLIP_PROCESSOR: Any | None = None
 
 
+def validate_image_collection_schema(collection_name: str, info: Any) -> None:
+    """Refuse to run against a collection that cannot accept CLIP vectors."""
+    vectors = info.config.params.vectors
+    image_vector = vectors.get("image") if isinstance(vectors, dict) else None
+    if image_vector is None or int(image_vector.size) != 512:
+        raise RuntimeError(
+            f"{collection_name} must use a named 512-dimensional 'image' vector; "
+            f"found {vectors!r}. Recreate the collection before ingestion."
+        )
+
+
 def _load_clip() -> tuple[Any | None, Any | None]:
     """Load CLIP model (singleton)."""
     global _CLIP_MODEL, _CLIP_PROCESSOR
@@ -62,6 +73,14 @@ def _load_clip() -> tuple[Any | None, Any | None]:
 
 def get_image_embedding(image_bytes: bytes) -> list[float] | None:
     """Get CLIP image embedding (512-dim) from image bytes."""
+    if settings.EMBEDDING_SERVER_URL:
+        try:
+            from api.services.embedding_client import get_clip_image_embedding
+
+            return get_clip_image_embedding(image_bytes)
+        except Exception as e:
+            logger.error("Remote CLIP embedding failed: %s", e)
+            return None
     model, processor = _load_clip()
     if model is None or processor is None:
         return None
@@ -116,6 +135,7 @@ def init_image_collection() -> None:
         schema: dict[str, Any] = {}
     else:
         info = client.get_collection(collection_name)
+        validate_image_collection_schema(collection_name, info)
         schema = getattr(info, "payload_schema", {}) or {}
 
     desired = {

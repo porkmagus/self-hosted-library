@@ -9,19 +9,23 @@ Uses async + thread pool so multiple concurrent requests keep the GPU fed contin
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from PIL import Image
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 _model: Any = None
 _model_name = ""
+_clip_model: Any = None
+_clip_processor: Any = None
 _executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="embed")
 # Semaphore to prevent GPU OOM from too many concurrent requests
 _gpu_semaphore = asyncio.Semaphore(4)
@@ -49,6 +53,32 @@ def _init_model(model_name: str):
     logger.info("Embedding model loaded on %s", _model.device)
 
 
+def _init_clip(model_name: str) -> None:
+    global _clip_model, _clip_processor
+    from transformers import CLIPModel, CLIPProcessor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Loading CLIP model '%s' on %s", model_name, device)
+    _clip_processor = CLIPProcessor.from_pretrained(model_name)
+    _clip_model = CLIPModel.from_pretrained(model_name).to(device)
+    _clip_model.eval()
+    logger.info("CLIP model loaded on %s", device)
+
+
+def _do_embed_image(image_bytes: bytes) -> list[float]:
+    """Decode and normalize one CLIP image embedding."""
+    if _clip_model is None or _clip_processor is None:
+        raise RuntimeError("CLIP model not loaded")
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        inputs = _clip_processor(images=[image.convert("RGB")], return_tensors="pt")
+    inputs = {name: value.to(_clip_model.device) for name, value in inputs.items()}
+    with torch.inference_mode():
+        vision_output = _clip_model.vision_model(**inputs)
+        vector = _clip_model.visual_projection(vision_output.pooler_output)
+        vector = vector / vector.norm(dim=-1, keepdim=True)
+    return [float(value) for value in vector[0].detach().cpu().tolist()]
+
+
 class EmbedRequest(BaseModel):
     texts: list[str]
     batch_size: int = 256
@@ -63,7 +93,9 @@ async def lifespan(app: FastAPI):
     import os
 
     model_name = os.environ.get("EMBED_MODEL", "bge-large")
+    clip_model_name = os.environ.get("CLIP_MODEL", "openai/clip-vit-base-patch32")
     _init_model(model_name)
+    _init_clip(clip_model_name)
     yield
     _executor.shutdown(wait=False)
 
@@ -127,6 +159,27 @@ async def embed(request: EmbedRequest) -> EmbedResponse:
     return EmbedResponse(embeddings=results)
 
 
+@app.post("/embed-image")
+async def embed_image(request: Request) -> dict[str, list[float]]:
+    """Embed one raw image using the shared GPU-resident CLIP model."""
+    if _clip_model is None:
+        raise HTTPException(503, "CLIP model not loaded")
+    image_bytes = await request.body()
+    if not image_bytes:
+        raise HTTPException(400, "Empty image body")
+    async with _gpu_semaphore:
+        loop = asyncio.get_running_loop()
+        try:
+            vector = await asyncio.wait_for(
+                loop.run_in_executor(_executor, _do_embed_image, image_bytes),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.exception("CLIP image embedding failed")
+            raise HTTPException(422, str(e)) from e
+    return {"embedding": vector}
+
+
 @app.get("/health")
 def health() -> dict:
     return {
@@ -134,4 +187,5 @@ def health() -> dict:
         "model": _model_name,
         "device": str(_model.device) if _model else "not loaded",
         "cuda_available": torch.cuda.is_available(),
+        "clip_loaded": _clip_model is not None,
     }

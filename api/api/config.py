@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # Dedicated embedding server
     EMBEDDING_SERVER_URL: str | None = None
+    CLIP_MODEL: str = "openai/clip-vit-base-patch32"
 
     # Qdrant
     QDRANT_URL: str = "http://localhost:6333"

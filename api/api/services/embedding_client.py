@@ -82,3 +82,18 @@ def get_embedding_batch(texts: list[str]) -> list[list[float] | None]:
             logger.error("Fallback embedding also failed: %s", fb_err)
 
     return results
+
+
+def get_clip_image_embedding(image_bytes: bytes) -> list[float]:
+    """Get a normalized CLIP image vector from the shared GPU service."""
+    response = _get_client().post(
+        "/embed-image",
+        content=image_bytes,
+        headers={"content-type": "application/octet-stream"},
+    )
+    response.raise_for_status()
+    payload = cast(dict, response.json())
+    embedding = payload.get("embedding")
+    if not isinstance(embedding, list) or len(embedding) != 512:
+        raise ValueError("Embedding server returned an invalid CLIP image vector")
+    return cast(list[float], embedding)

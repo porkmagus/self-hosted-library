@@ -7,6 +7,7 @@ import io
 import json
 import tempfile
 import threading
+import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -58,6 +59,36 @@ ARTIFACT_SCHEMA_VERSION = 1
 
 class InvalidDocumentError(ValueError):
     """The source is readable but cannot produce a searchable artifact."""
+
+
+def build_standalone_image_entry(
+    image_bytes: bytes,
+    *,
+    extension: str,
+    book_uuid: str,
+    book_title: str,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    """Build a restart-stable manifest entry for a standalone image."""
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    image_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"grimoire:standalone:{book_uuid}:{image_sha256}",
+        )
+    )
+    return {
+        "image_id": image_id,
+        "image_bytes": image_bytes,
+        "image_sha256": image_sha256,
+        "ext": extension.lstrip(".").lower(),
+        "page_number": 0,
+        "width": width,
+        "height": height,
+        "book_id": book_uuid,
+        "book_title": book_title,
+    }
 
 
 class PipelineStore(Protocol):
@@ -495,10 +526,6 @@ def run_ingestion_pipeline(
             # Fast path: skip text extraction/chunking, go straight to image embedding
             with source_path.open("rb") as f:
                 image_bytes = f.read()
-            image_sha256 = hashlib.sha256(image_bytes).hexdigest()
-            ext = snapshot.extension.lstrip(".").lower()
-            image_id = str(uuid.uuid4())
-
             width, height = 0, 0
             try:
                 from PIL import Image as PIL_Image
@@ -507,17 +534,16 @@ def run_ingestion_pipeline(
             except Exception:
                 pass
 
-            extracted_images = [{
-                "image_id": image_id,
-                "image_bytes": image_bytes,
-                "image_sha256": image_sha256,
-                "ext": ext,
-                "page_number": 0,
-                "width": width,
-                "height": height,
-                "book_id": snapshot.book_uuid,
-                "book_title": snapshot.book_title,
-            }]
+            extracted_images = [
+                build_standalone_image_entry(
+                    image_bytes,
+                    extension=snapshot.extension,
+                    book_uuid=snapshot.book_uuid,
+                    book_title=snapshot.book_title,
+                    width=width,
+                    height=height,
+                )
+            ]
 
             watchdog.check()
             image_manifest_bytes, image_entries = _build_image_manifest(
@@ -536,6 +562,20 @@ def run_ingestion_pipeline(
                 image_manifest_bytes,
                 "application/json",
             )
+            # Activation intentionally requires identities for both vector sets.
+            # Image-only documents therefore commit a canonical empty text
+            # manifest instead of weakening the activation contract.
+            manifest_bytes, fragments = _build_manifest([])
+            manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            manifest_key = (
+                f"jobs/{job_uuid}/g{lease.generation}/chunks-{manifest_sha}.json"
+            )
+            _upload_verified(
+                deps.store,
+                manifest_key,
+                manifest_bytes,
+                "application/json",
+            )
             watchdog.check()
             snapshot = _set_stage(
                 deps,
@@ -545,9 +585,14 @@ def run_ingestion_pipeline(
                 values={
                     "image_manifest_key": image_manifest_key,
                     "image_manifest_sha256": image_manifest_sha,
+                    "chunk_manifest_key": manifest_key,
+                    "chunk_manifest_sha256": manifest_sha,
+                    "chunker_version": CHUNKER_VERSION,
+                    "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                    "total_chunks": 0,
                     "total_images": len(image_entries),
                 },
-                book_status=BookStatus.INDEXING,
+                book_status=BookStatus.EMBEDDING,
                 book_values={
                     "total_images": len(image_entries),
                     "indexed_images": 0,
@@ -851,27 +896,11 @@ def run_ingestion_pipeline(
     with deps.sessions() as session:
         _lock_current_book(session, job_uuid, lease.generation)
         complete_job(session, lease)
-        # Inline activation — skip outbox round-trip for speed
-        from api.services.ingestion_activation import (
-            reconcile_generation_activation,
-            ActivationRejected,
-        )
-        try:
-            result = reconcile_generation_activation(session, job_uuid)
-            session.commit()
-            activation_token = str(result["activation_token"])
-            status = "indexed"
-        except ActivationRejected as exc:
-            logger.warning("Activation rejected for %s: %s — will retry via outbox", job_uuid, exc)
-            session.rollback()
-            create_event(session, job_uuid, "activate_generation")
-            session.commit()
-            activation_token = ""
-            status = "awaiting_activation"
+        create_event(session, job_uuid, "activate_generation")
+        session.commit()
     return {
         "book_id": snapshot.book_uuid,
         "indexed_chunks": indexed,
         "indexed_images": indexed_images,
-        "status": status,
-        "activation_token": activation_token,
+        "status": "awaiting_activation",
     }

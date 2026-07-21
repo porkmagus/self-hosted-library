@@ -68,6 +68,7 @@ def make_celery() -> Celery:
         task_reject_on_worker_lost=True,
         task_queues={
             "celery": {"routing_key": "celery"},
+            "ingestion": {"routing_key": "ingestion"},
             "high": {"routing_key": "high"},
         },
         task_default_queue="celery",
@@ -76,7 +77,7 @@ def make_celery() -> Celery:
             "ingest.activate": {"queue": "high"},
             "ingest.cleanup_book": {"queue": "high"},
             "ingest.dispatch_outbox": {"queue": "high"},
-            "ingest.job": {"queue": "high"},
+            "ingest.job": {"queue": "ingestion"},
         },
         broker_transport_options={"visibility_timeout": 12 * 60 * 60},
         beat_schedule={

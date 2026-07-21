@@ -118,6 +118,7 @@ services:
 
   ollama:
     image: ollama/ollama:0.12.10
+    profiles: ["ollama"]
     restart: unless-stopped
     logging: *default-logging
     networks: [library]
@@ -139,8 +140,6 @@ services:
     environment:
       <<: *api-env
       EMBEDDING_SERVER_URL: "http://localhost:8001"
-    ports:
-      - "127.0.0.1:8001:8001"
     depends_on:
       postgres: {condition: service_healthy}
     healthcheck:
@@ -172,7 +171,7 @@ services:
 
   worker:
     <<: *app-image
-    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork", "--queues=high,celery"]
+    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork", "--queues=ingestion,celery"]
     environment:
       <<: *api-env
       EMBEDDING_SERVER_URL: "http://embedding_server:8001"
