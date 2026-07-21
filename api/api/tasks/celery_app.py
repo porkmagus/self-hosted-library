@@ -66,6 +66,17 @@ def make_celery() -> Celery:
         worker_prefetch_multiplier=1,
         task_acks_late=True,
         task_reject_on_worker_lost=True,
+        task_queues={
+            "celery": {"routing_key": "celery"},
+            "high": {"routing_key": "high"},
+        },
+        task_default_queue="celery",
+        task_default_routing_key="celery",
+        task_routes = {
+            "ingest.activate": {"queue": "high"},
+            "ingest.cleanup_book": {"queue": "high"},
+            "ingest.dispatch_outbox": {"queue": "high"},
+        },
         broker_transport_options={"visibility_timeout": 12 * 60 * 60},
         beat_schedule={
             "publish-ingestion-outbox": {

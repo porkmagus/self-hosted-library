@@ -47,7 +47,7 @@ def _load_clip() -> tuple[Any | None, Any | None]:
         from transformers import CLIPModel, CLIPProcessor
 
         model_path = os.environ.get(
-            "CLIP_MODEL_PATH", "/app/models/clip-vit-base-patch32"
+            "CLIP_MODEL_PATH", "openai/clip-vit-base-patch32"
         )
         logger.info("Loading CLIP model from %s", model_path)
         _CLIP_MODEL = CLIPModel.from_pretrained(model_path)

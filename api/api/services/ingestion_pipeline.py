@@ -185,6 +185,20 @@ def _extract(path: Path, extension: str, output_dir: Path) -> str:
         return extract_docx(path)
     if extension in {".txt", ".md", ".htm", ".html"}:
         return extract_text_file(path)
+    # Standalone images - extract metadata as text for search
+    if extension in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}:
+        meta = extract_image_metadata(path)
+        if not meta:
+            raise InvalidDocumentError("Image metadata extraction produced no data")
+        # Build searchable text from metadata
+        text_parts = [
+            f"Image format: {meta.get('format', 'unknown')}",
+            f"Size: {meta.get('width', 0)}x{meta.get('height', 0)}",
+            f"Mode: {meta.get('mode', 'unknown')}",
+        ]
+        if "exif" in meta:
+            text_parts.append(f"EXIF: {meta['exif']}")
+        return " | ".join(text_parts)
     raise InvalidDocumentError(f"Unsupported format: {extension}")
 
 
@@ -464,94 +478,166 @@ def run_ingestion_pipeline(
                 "Downloaded source hash does not match accepted upload"
             )
 
-        if snapshot.stage == IngestionStage.SOURCE_READY:
-            snapshot = _set_stage(
-                deps,
-                lease,
-                expected=IngestionStage.SOURCE_READY,
-                next_stage=IngestionStage.EXTRACTING,
-                values={},
-                book_status=BookStatus.EXTRACTING,
-            )
+        standalone_image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
+        is_standalone_image = snapshot.extension in standalone_image_exts
 
-        text_path = workdir / "extracted.txt"
-        if snapshot.extracted_text_key and snapshot.extracted_text_sha256:
-            text_bytes = _read_verified_artifact(
-                deps.store,
-                snapshot.extracted_text_key,
-                snapshot.extracted_text_sha256,
-                text_path,
-            )
-            text_content = text_bytes.decode("utf-8")
-        else:
-            if snapshot.stage != IngestionStage.EXTRACTING:
-                raise InvalidDocumentError(
-                    "Extraction artifact missing after stage advancement"
-                )
-            text_content = deps.extract(
-                source_path, snapshot.extension, workdir
-            ).strip()
-            watchdog.check()
-            if len(text_content) < 10:
-                raise InvalidDocumentError("Extraction produced insufficient text")
-            text_bytes = text_content.encode("utf-8")
-            text_sha = hashlib.sha256(text_bytes).hexdigest()
-            text_key = f"jobs/{job_uuid}/g{lease.generation}/extracted-{text_sha}.txt"
-            _upload_verified(deps.store, text_key, text_bytes, "text/plain")
-            watchdog.check()
-            snapshot = _set_stage(
-                deps,
-                lease,
-                expected=IngestionStage.EXTRACTING,
-                next_stage=IngestionStage.CHUNKING,
-                values={
-                    "extracted_text_key": text_key,
-                    "extracted_text_sha256": text_sha,
-                },
-                book_status=BookStatus.CHUNKING,
-            )
+        if is_standalone_image:
+            # Fast path: skip text extraction/chunking, go straight to image embedding
+            with source_path.open("rb") as f:
+                image_bytes = f.read()
+            image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+            ext = snapshot.extension.lstrip(".").lower()
+            image_id = str(uuid.uuid4())
 
-        manifest_path = workdir / "chunks.json"
-        if snapshot.chunk_manifest_key and snapshot.chunk_manifest_sha256:
-            manifest_bytes = _read_verified_artifact(
+            width, height = 0, 0
+            try:
+                from PIL import Image as PIL_Image
+                with PIL_Image.open(io.BytesIO(image_bytes)) as img:
+                    width, height = img.size
+            except Exception:
+                pass
+
+            extracted_images = [{
+                "image_id": image_id,
+                "image_bytes": image_bytes,
+                "image_sha256": image_sha256,
+                "ext": ext,
+                "page_number": 0,
+                "width": width,
+                "height": height,
+                "book_id": snapshot.book_uuid,
+                "book_title": snapshot.book_title,
+            }]
+
+            watchdog.check()
+            image_manifest_bytes, image_entries = _build_image_manifest(
+                extracted_images,
                 deps.store,
-                snapshot.chunk_manifest_key,
-                snapshot.chunk_manifest_sha256,
-                manifest_path,
+                book_uuid=snapshot.book_uuid,
+                generation=lease.generation,
             )
-            chunks, fragments = _parse_manifest(manifest_bytes)
-            manifest_sha = snapshot.chunk_manifest_sha256
-        else:
-            if snapshot.stage != IngestionStage.CHUNKING:
-                raise InvalidDocumentError(
-                    "Chunk manifest missing after stage advancement"
-                )
-            chunks = deps.chunk(text_content)
-            if not chunks:
-                raise InvalidDocumentError("Chunking produced no canonical chunks")
-            manifest_bytes, fragments = _build_manifest(chunks)
-            manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
-            manifest_key = (
-                f"jobs/{job_uuid}/g{lease.generation}/chunks-{manifest_sha}.json"
+            image_manifest_sha = hashlib.sha256(image_manifest_bytes).hexdigest()
+            image_manifest_key = (
+                f"jobs/{job_uuid}/g{lease.generation}/images-{image_manifest_sha}.json"
             )
             _upload_verified(
-                deps.store, manifest_key, manifest_bytes, "application/json"
+                deps.store,
+                image_manifest_key,
+                image_manifest_bytes,
+                "application/json",
             )
             watchdog.check()
             snapshot = _set_stage(
                 deps,
                 lease,
-                expected=IngestionStage.CHUNKING,
-                next_stage=IngestionStage.EMBEDDING,
+                expected=snapshot.stage,
+                next_stage=IngestionStage.IMAGES,
                 values={
-                    "chunk_manifest_key": manifest_key,
-                    "chunk_manifest_sha256": manifest_sha,
-                    "chunker_version": CHUNKER_VERSION,
-                    "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
-                    "total_chunks": len(chunks),
+                    "image_manifest_key": image_manifest_key,
+                    "image_manifest_sha256": image_manifest_sha,
+                    "total_images": len(image_entries),
                 },
-                book_status=BookStatus.EMBEDDING,
+                book_status=BookStatus.INDEXING,
+                book_values={
+                    "total_images": len(image_entries),
+                    "indexed_images": 0,
+                },
             )
+            text_content = ""
+            chunks = []
+            fragments = []
+            manifest_sha = ""
+            indexed = 0
+        else:
+            # Normal text document pipeline
+            if snapshot.stage == IngestionStage.SOURCE_READY:
+                snapshot = _set_stage(
+                    deps,
+                    lease,
+                    expected=IngestionStage.SOURCE_READY,
+                    next_stage=IngestionStage.EXTRACTING,
+                    values={},
+                    book_status=BookStatus.EXTRACTING,
+                )
+
+            text_path = workdir / "extracted.txt"
+            if snapshot.extracted_text_key and snapshot.extracted_text_sha256:
+                text_bytes = _read_verified_artifact(
+                    deps.store,
+                    snapshot.extracted_text_key,
+                    snapshot.extracted_text_sha256,
+                    text_path,
+                )
+                text_content = text_bytes.decode("utf-8")
+            else:
+                if snapshot.stage != IngestionStage.EXTRACTING:
+                    raise InvalidDocumentError(
+                        "Extraction artifact missing after stage advancement"
+                    )
+                text_content = deps.extract(
+                    source_path, snapshot.extension, workdir
+                ).strip()
+                watchdog.check()
+                if len(text_content) < 10:
+                    raise InvalidDocumentError("Extraction produced insufficient text")
+                text_bytes = text_content.encode("utf-8")
+                text_sha = hashlib.sha256(text_bytes).hexdigest()
+                text_key = f"jobs/{job_uuid}/g{lease.generation}/extracted-{text_sha}.txt"
+                _upload_verified(deps.store, text_key, text_bytes, "text/plain")
+                watchdog.check()
+                snapshot = _set_stage(
+                    deps,
+                    lease,
+                    expected=IngestionStage.EXTRACTING,
+                    next_stage=IngestionStage.CHUNKING,
+                    values={
+                        "extracted_text_key": text_key,
+                        "extracted_text_sha256": text_sha,
+                    },
+                    book_status=BookStatus.CHUNKING,
+                )
+
+            manifest_path = workdir / "chunks.json"
+            if snapshot.chunk_manifest_key and snapshot.chunk_manifest_sha256:
+                manifest_bytes = _read_verified_artifact(
+                    deps.store,
+                    snapshot.chunk_manifest_key,
+                    snapshot.chunk_manifest_sha256,
+                    manifest_path,
+                )
+                chunks, fragments = _parse_manifest(manifest_bytes)
+                manifest_sha = snapshot.chunk_manifest_sha256
+            else:
+                if snapshot.stage != IngestionStage.CHUNKING:
+                    raise InvalidDocumentError(
+                        "Chunk manifest missing after stage advancement"
+                    )
+                chunks = deps.chunk(text_content)
+                if not chunks:
+                    raise InvalidDocumentError("Chunking produced no canonical chunks")
+                manifest_bytes, fragments = _build_manifest(chunks)
+                manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+                manifest_key = (
+                    f"jobs/{job_uuid}/g{lease.generation}/chunks-{manifest_sha}.json"
+                )
+                _upload_verified(
+                    deps.store, manifest_key, manifest_bytes, "application/json"
+                )
+                watchdog.check()
+                snapshot = _set_stage(
+                    deps,
+                    lease,
+                    expected=IngestionStage.CHUNKING,
+                    next_stage=IngestionStage.EMBEDDING,
+                    values={
+                        "chunk_manifest_key": manifest_key,
+                        "chunk_manifest_sha256": manifest_sha,
+                        "chunker_version": CHUNKER_VERSION,
+                        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+                        "total_chunks": len(chunks),
+                    },
+                    book_status=BookStatus.EMBEDDING,
+                )
 
         indexed = snapshot.indexed_chunks
         batch_size = settings.INGEST_CHECKPOINT_BATCH_SIZE
@@ -630,13 +716,48 @@ def run_ingestion_pipeline(
                 raise InvalidDocumentError(
                     "Image manifest missing after stage advancement"
                 )
-            extracted_images = (
-                deps.extract_images(
+            extracted_images = []
+            standalone_image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
+            
+            # Extract images from PDFs
+            if snapshot.extension == ".pdf":
+                extracted_images = deps.extract_images(
                     str(source_path), snapshot.book_uuid, snapshot.book_title
                 )
-                if snapshot.extension == ".pdf"
-                else []
-            )
+            
+            # Handle standalone images - they become searchable images
+            if snapshot.extension in standalone_image_exts:
+                import uuid as uuid_module
+                from PIL import Image as PIL_Image
+                watchdog.check()
+                with source_path.open("rb") as f:
+                    image_bytes = f.read()
+                image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+                ext = snapshot.extension.lstrip(".").lower()
+                image_id = str(uuid_module.uuid4())
+                
+                # Get actual dimensions
+                width, height = 0, 0
+                try:
+                    with PIL_Image.open(io.BytesIO(image_bytes)) as img:
+                        width, height = img.size
+                except Exception:
+                    pass
+                
+                extracted_images = [
+                    {
+                        "image_id": image_id,
+                        "image_bytes": image_bytes,
+                        "image_sha256": image_sha256,
+                        "ext": ext,
+                        "page_number": 0,
+                        "width": width,
+                        "height": height,
+                        "book_id": snapshot.book_uuid,
+                        "book_title": snapshot.book_title,
+                    }
+                ]
+            
             watchdog.check()
             image_manifest_bytes, image_entries = _build_image_manifest(
                 extracted_images,

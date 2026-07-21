@@ -79,7 +79,11 @@ def claim_dispatch_events(
                 ),
             ),
         )
-        .order_by(IngestionOutbox.id)
+        .order_by(
+            # Priority: activation/cleanup before ingestion dispatch
+            (IngestionOutbox.event_type != "dispatch_ingestion").desc(),
+            IngestionOutbox.id,
+        )
         .limit(limit)
         .with_for_update(skip_locked=True)
     )

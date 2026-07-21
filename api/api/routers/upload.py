@@ -26,6 +26,14 @@ SUPPORTED_EXTENSIONS = {
     ".md",
     ".htm",
     ".html",
+    # Standalone images - get CLIP-embedded for search
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".webp",
 }
 
 

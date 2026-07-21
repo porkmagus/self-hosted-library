@@ -162,7 +162,7 @@ def extract_epub(epub_path: Path) -> str:
 
     book = ebooklib_epub.read_epub(str(epub_path))
     text_parts = []
-    for item in book.get_items_of_type(ebooklib_epub.EBOOK_HTMLITEM):
+    for item in book.get_items_of_type(ebooklib_epub.EpubHtml):
         content = item.get_content().decode("utf-8", errors="replace")
         # Strip HTML tags for clean text
         clean = re.sub(r"<[^>]+>", "", content)
@@ -189,6 +189,41 @@ def extract_text_file(text_path: Path) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return text_path.read_bytes().decode("utf-8", errors="replace")
+
+
+# Image metadata extraction
+def extract_image_metadata(image_path: Path) -> dict[str, Any]:
+    """Extract EXIF/metadata from standalone images for searchable text."""
+    import json
+    from PIL import Image, ExifTags
+
+    result: dict[str, Any] = {}
+    try:
+        with Image.open(str(image_path)) as img:
+            result["format"] = img.format or "unknown"
+            result["mode"] = img.mode
+            result["size"] = img.size
+            result["width"] = img.size[0]
+            result["height"] = img.size[1]
+
+            # Extract EXIF data
+            try:
+                exif_data = img._getexif()
+                if exif_data:
+                    exif_text = []
+                    for tag_id, value in exif_data.items():
+                        tag = ExifTags.TAGS.get(tag_id, tag_id)
+                        if isinstance(value, (bytes, bytearray)):
+                            value = value.decode("utf-8", errors="replace")
+                        exif_text.append(f"{tag}: {value}")
+                    if exif_text:
+                        result["exif"] = "; ".join(exif_text)
+            except (AttributeError, Exception):
+                pass  # No EXIF data available
+    except Exception as e:
+        logger.warning("Failed to extract metadata from %s: %s", image_path, e)
+
+    return result
 
 
 # Semantic chunking

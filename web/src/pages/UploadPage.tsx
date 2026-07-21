@@ -4,7 +4,7 @@ import { api } from "../lib/api"
 import { formatSize } from "../lib/format"
 import { ErrorBanner } from "../components"
 
-const ACCEPT = ".pdf,.epub,.doc,.docx,.txt,.md,.htm,.html"
+const ACCEPT = ".pdf,.epub,.doc,.docx,.txt,.md,.htm,.html,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.webp"
 
 export function UploadPage() {
   const [status, setStatus] = useState("")

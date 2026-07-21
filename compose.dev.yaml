@@ -5,15 +5,21 @@ services:
       context: .
       dockerfile: Dockerfile
     image: self-hosted-library:dev
+    volumes:
+      - ${GRIMOIRE_DATA:-/home/sean/grimoire-data}:/app/data
 
   worker:
     build:
       context: .
       dockerfile: Dockerfile
     image: self-hosted-library:dev
+    volumes:
+      - ${GRIMOIRE_DATA:-/home/sean/grimoire-data}:/app/data
 
   beat:
     build:
       context: .
       dockerfile: Dockerfile
     image: self-hosted-library:dev
+    volumes:
+      - ${GRIMOIRE_DATA:-/home/sean/grimoire-data}:/app/data

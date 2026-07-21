@@ -32,6 +32,10 @@ docker compose version >/dev/null || { echo "Docker Compose v2 is required" >&2;
 
 declare -a COMPOSE=(docker compose -f compose.yaml)
 $DEV && COMPOSE+=(-f compose.dev.yaml)
+# Auto-include GPU overlay if NVIDIA GPU is available
+if [ -f compose.gpu.yaml ] && command -v nvidia-container-cli >/dev/null 2>&1; then
+    COMPOSE+=(-f compose.gpu.yaml)
+fi
 
 say "Configuration"
 if [ -f .env ] && ! $REGENERATE; then

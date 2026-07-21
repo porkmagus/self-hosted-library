@@ -152,7 +152,7 @@ services:
 
   worker:
     <<: *app-image
-    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork"]
+    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork", "--queues=high,celery"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
