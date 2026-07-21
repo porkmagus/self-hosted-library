@@ -76,6 +76,7 @@ def make_celery() -> Celery:
             "ingest.activate": {"queue": "high"},
             "ingest.cleanup_book": {"queue": "high"},
             "ingest.dispatch_outbox": {"queue": "high"},
+            "ingest.job": {"queue": "high"},
         },
         broker_transport_options={"visibility_timeout": 12 * 60 * 60},
         beat_schedule={
