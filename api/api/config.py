@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     EMBED_MODEL: str = "bge-large"
     EMBED_DIMENSION: int = 1024
 
+    # Dedicated embedding server
+    EMBEDDING_SERVER_URL: str | None = None
+
     # Qdrant
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION: str = "library_documents"

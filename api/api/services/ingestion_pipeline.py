@@ -41,7 +41,7 @@ from api.services.ingestion_jobs import (
 )
 from api.services.ingestion_outbox import create_event
 from api.services.object_store import get_object_store
-from api.services.ollama_svc import get_embedding_batch
+from api.services.embedding_client import get_embedding_batch
 from api.services.parser_svc import (
     chunk_text_semantic,
     convert_pdf_with_marker,
