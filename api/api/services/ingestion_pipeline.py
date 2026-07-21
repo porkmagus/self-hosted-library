@@ -471,7 +471,12 @@ def run_ingestion_pipeline(
     ):
         workdir = Path(temp)
         source_path = workdir / f"source{snapshot.extension}"
-        deps.store.download_to(snapshot.source_key, source_path)
+        if snapshot.source_key and snapshot.source_key.startswith("/"):
+            # Local filesystem path (inbox bypass): copy directly, skip object store
+            import shutil
+            shutil.copy2(snapshot.source_key, source_path)
+        else:
+            deps.store.download_to(snapshot.source_key, source_path)
         watchdog.check()
         if _file_hash(source_path) != snapshot.source_hash:
             raise InvalidDocumentError(

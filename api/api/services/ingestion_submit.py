@@ -83,12 +83,17 @@ def submit_uploaded_book(
     store: UploadStore,
     title: str | None = None,
     author: str | None = None,
+    local_path: str | None = None,
 ) -> SubmissionResult:
-    """Reserve, stream, verify, then atomically create the job and outbox event."""
+    """Reserve, stream, verify, then atomically create the job and outbox event.
+
+    When local_path is provided (inbox files), skips object-store upload — the
+    pipeline reads directly from disk, bypassing S3 round-trips.
+    """
     safe_name = validate_filename(filename)
     extension = Path(safe_name).suffix.lower() or ".bin"
     book_uuid = str(uuid.uuid4())
-    source_key = f"books/{book_uuid}/source{extension}"
+    source_key = local_path or f"books/{book_uuid}/source{extension}"
     inferred_title = Path(safe_name).stem.replace("_", " ").strip() or safe_name
 
     # TX1: a durable reservation makes any post-upload crash discoverable.
@@ -108,31 +113,34 @@ def submit_uploaded_book(
 
     length = _stream_length(stream)
     hashing_stream = HashingReader(stream)
-    try:
-        store.upload_stream(
-            source_key,
-            hashing_stream,  # type: ignore[arg-type]
-            length=length,
-            content_type=content_type,
-        )
-        if hashing_stream.bytes_read != length:
-            raise OSError(
-                f"Object store consumed {hashing_stream.bytes_read} of {length} bytes"
+    if local_path:
+        # Inbox file: hash directly from disk, skip object-store upload
+        digest = hashlib.sha256(Path(local_path).read_bytes()).hexdigest()
+    else:
+        try:
+            store.upload_stream(
+                source_key,
+                hashing_stream,  # type: ignore[arg-type]
+                length=length,
+                content_type=content_type,
             )
-        remote = store.stat(source_key)
-        if int(remote.size) != length:
-            raise OSError(
-                f"Object-store HEAD returned {remote.size} bytes, expected {length}"
-            )
-    except Exception as exc:
-        session.rollback()
-        failed = session.query(Book).filter_by(uuid=book_uuid).one()
-        failed.status = BookStatus.FAILED
-        failed.error_message = str(exc)[:4000]
-        session.commit()
-        raise
-
-    digest = hashing_stream.hexdigest
+            if hashing_stream.bytes_read != length:
+                raise OSError(
+                    f"Object store consumed {hashing_stream.bytes_read} of {length} bytes"
+                )
+            remote = store.stat(source_key)
+            if int(remote.size) != length:
+                raise OSError(
+                    f"Object-store HEAD returned {remote.size} bytes, expected {length}"
+                )
+        except Exception as exc:
+            session.rollback()
+            failed = session.query(Book).filter_by(uuid=book_uuid).one()
+            failed.status = BookStatus.FAILED
+            failed.error_message = str(exc)[:4000]
+            session.commit()
+            raise
+        digest = hashing_stream.hexdigest
     session.rollback()
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         session.execute(
@@ -143,11 +151,12 @@ def submit_uploaded_book(
     reservation = session.query(Book).filter_by(uuid=book_uuid).with_for_update().one()
     if reservation.status != BookStatus.UPLOADING:
         raise RuntimeError("Upload reservation is no longer accepting uploads")
-    accepted_remote = store.stat(source_key)
-    if int(accepted_remote.size) != length:
-        raise OSError(
-            f"Object-store HEAD returned {accepted_remote.size} bytes during acceptance, expected {length}"
-        )
+    if not local_path:
+        accepted_remote = store.stat(source_key)
+        if int(accepted_remote.size) != length:
+            raise OSError(
+                f"Object-store HEAD returned {accepted_remote.size} bytes during acceptance, expected {length}"
+            )
     canonical = (
         session.query(Book)
         .filter(
@@ -166,7 +175,8 @@ def submit_uploaded_book(
         )
         session.delete(reservation)
         session.commit()
-        store.delete(source_key)
+        if not local_path:
+            store.delete(source_key)
         if canonical_job is None:
             raise RuntimeError("Canonical upload exists without an ingestion job")
         return SubmissionResult(

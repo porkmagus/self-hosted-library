@@ -275,6 +275,7 @@ def ingest_book_task(book_path: str) -> dict[str, Any]:
             content_type="application/octet-stream",
             stream=source,
             store=get_object_store(),
+            local_path=str(path.resolve()),
         )
     return {
         "book_id": result.book_uuid,
