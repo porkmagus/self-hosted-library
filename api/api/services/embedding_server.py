@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 _model: Any = None
 _model_name = ""
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed")
+_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="embed")
 # Semaphore to prevent GPU OOM from too many concurrent requests
-_gpu_semaphore = asyncio.Semaphore(2)
+_gpu_semaphore = asyncio.Semaphore(4)
 
 
 def _init_model(model_name: str):

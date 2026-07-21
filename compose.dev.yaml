@@ -16,6 +16,12 @@ services:
     volumes:
       - ${GRIMOIRE_DATA:-/home/sean/grimoire-data}:/app/data
 
+  worker_high:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: self-hosted-library:dev
+
   beat:
     build:
       context: .

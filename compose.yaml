@@ -172,7 +172,26 @@ services:
 
   worker:
     <<: *app-image
-    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork", "--queues=high,celery"]
+    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork", "--queues=celery"]
+    environment:
+      <<: *api-env
+      EMBEDDING_SERVER_URL: "http://embedding_server:8001"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      seaweedfs: {condition: service_healthy}
+      embedding_server: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A api.tasks.celery_app inspect ping -d celery@$$HOSTNAME 2>/dev/null | grep -q pong"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 45s
+
+  worker_high:
+    <<: *app-image
+    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4", "--pool=prefork", "--queues=high"]
     environment:
       <<: *api-env
       EMBEDDING_SERVER_URL: "http://embedding_server:8001"
