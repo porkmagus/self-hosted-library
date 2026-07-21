@@ -472,9 +472,14 @@ def run_ingestion_pipeline(
         workdir = Path(temp)
         source_path = workdir / f"source{snapshot.extension}"
         if snapshot.source_key and snapshot.source_key.startswith("/"):
-            # Local filesystem path (inbox bypass): copy directly, skip object store
+            # Local filesystem path (inbox bypass): copy directly if it exists
             import shutil
-            shutil.copy2(snapshot.source_key, source_path)
+            local_src = Path(snapshot.source_key)
+            if not local_src.exists():
+                raise InvalidDocumentError(
+                    f"Local source file no longer exists: {snapshot.source_key}"
+                )
+            shutil.copy2(local_src, source_path)
         else:
             deps.store.download_to(snapshot.source_key, source_path)
         watchdog.check()
