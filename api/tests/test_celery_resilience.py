@@ -10,3 +10,7 @@ def test_celery_redelivers_worker_loss_without_killing_healthy_long_jobs() -> No
     assert conf.broker_transport_options["visibility_timeout"] >= 12 * 60 * 60
     assert conf.task_time_limit is None
     assert conf.task_soft_time_limit is None
+
+
+def test_memory_heavy_prefork_children_are_recycled_after_their_task() -> None:
+    assert celery_app.conf.worker_max_memory_per_child == 1_500_000

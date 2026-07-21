@@ -64,6 +64,9 @@ def make_celery() -> Celery:
         task_time_limit=None,
         task_soft_time_limit=None,
         worker_prefetch_multiplier=1,
+        # Large illustrated PDFs can permanently inflate prefork child RSS.
+        # Celery replaces the child only after its current task completes.
+        worker_max_memory_per_child=1_500_000,
         task_acks_late=True,
         task_reject_on_worker_lost=True,
         task_queues={
