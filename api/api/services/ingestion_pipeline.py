@@ -846,11 +846,27 @@ def run_ingestion_pipeline(
     with deps.sessions() as session:
         _lock_current_book(session, job_uuid, lease.generation)
         complete_job(session, lease)
-        create_event(session, job_uuid, "activate_generation")
-        session.commit()
+        # Inline activation — skip outbox round-trip for speed
+        from api.services.ingestion_activation import (
+            reconcile_generation_activation,
+            ActivationRejected,
+        )
+        try:
+            result = reconcile_generation_activation(session, job_uuid)
+            session.commit()
+            activation_token = str(result["activation_token"])
+            status = "indexed"
+        except ActivationRejected as exc:
+            logger.warning("Activation rejected for %s: %s — will retry via outbox", job_uuid, exc)
+            session.rollback()
+            create_event(session, job_uuid, "activate_generation")
+            session.commit()
+            activation_token = ""
+            status = "awaiting_activation"
     return {
         "book_id": snapshot.book_uuid,
         "indexed_chunks": indexed,
         "indexed_images": indexed_images,
-        "status": "awaiting_activation",
+        "status": status,
+        "activation_token": activation_token,
     }
