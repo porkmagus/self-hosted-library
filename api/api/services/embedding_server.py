@@ -1,13 +1,17 @@
 """Dedicated embedding server — keeps model permanently loaded on GPU.
 
 Workers send HTTP requests for embeddings and go back to parsing immediately.
-This creates a continuous pipeline keeping the GPU constantly fed.
+Multiple workers all hitting the same server = constant stream = GPU stays pinned.
+
+Uses async + thread pool so multiple concurrent requests keep the GPU fed continuously.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -16,9 +20,11 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-# --- Model initialization (happens once at startup) ---
 _model: Any = None
 _model_name = ""
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed")
+# Semaphore to prevent GPU OOM from too many concurrent requests
+_gpu_semaphore = asyncio.Semaphore(2)
 
 
 def _init_model(model_name: str):
@@ -26,7 +32,6 @@ def _init_model(model_name: str):
     from sentence_transformers import SentenceTransformer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     model_map = {
         "bge-large": "BAAI/bge-large-en-v1.5",
         "bge-small": "BAAI/bge-small-en-v1.5",
@@ -55,12 +60,12 @@ class EmbedResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: load model
     import os
 
     model_name = os.environ.get("EMBED_MODEL", "bge-large")
     _init_model(model_name)
     yield
+    _executor.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -69,12 +74,8 @@ app = FastAPI(
 )
 
 
-@app.post("/embed", response_model=EmbedResponse)
-def embed(request: EmbedRequest) -> EmbedResponse:
-    """Get embeddings for a batch of texts."""
-    if _model is None:
-        raise HTTPException(503, "Model not loaded")
-
+def _do_embed(request: EmbedRequest) -> list[list[float] | None]:
+    """Run embedding in a thread — releases GIL, allows concurrent GPU work."""
     max_chars = 2048
     cleaned: list[str] = []
     indices: list[int] = []
@@ -92,29 +93,42 @@ def embed(request: EmbedRequest) -> EmbedResponse:
     results: list[list[float] | None] = [None] * len(request.texts)
 
     if not cleaned:
-        return EmbedResponse(embeddings=results)
+        return results
 
-    try:
-        embeddings = _model.encode(
-            cleaned,
-            batch_size=request.batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        for j, emb in enumerate(embeddings):
-            results[indices[j]] = emb.tolist()
-    except Exception as e:
-        logger.error("Embedding failed: %s", e)
-        raise HTTPException(500, str(e))
+    embeddings = _model.encode(
+        cleaned,
+        batch_size=request.batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
+    for j, emb in enumerate(embeddings):
+        results[indices[j]] = emb.tolist()
+    return results
+
+
+@app.post("/embed", response_model=EmbedResponse)
+async def embed(request: EmbedRequest) -> EmbedResponse:
+    """Get embeddings for a batch of texts. Async so multiple requests can queue."""
+    if _model is None:
+        raise HTTPException(503, "Model not loaded")
+
+    async with _gpu_semaphore:
+        loop = asyncio.get_event_loop()
+        try:
+            results = await asyncio.wait_for(
+                loop.run_in_executor(_executor, lambda: _do_embed(request)),
+                timeout=120,
+            )
+        except Exception as e:
+            logger.error("Embedding failed: %s", e)
+            raise HTTPException(500, str(e))
 
     return EmbedResponse(embeddings=results)
 
 
 @app.get("/health")
 def health() -> dict:
-    import torch
-
     return {
         "status": "ok",
         "model": _model_name,
