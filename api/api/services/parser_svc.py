@@ -115,17 +115,12 @@ def _acquire_ocr_lock(lock: object, timeout_seconds: float) -> None:
 
 
 def extract_pdf_ocr(pdf_path: Path, output_dir: Path) -> str:
-    """OCR a PDF in an isolated, serialized subprocess."""
+    """OCR a PDF in an isolated subprocess."""
     output_path = output_dir / f"{pdf_path.stem}.ocr.txt"
     try:
         timeout = finite_positive(
             os.environ.get("PDF_OCR_TIMEOUT_SECONDS", "3600"),
             name="PDF_OCR_TIMEOUT_SECONDS",
-            maximum=3600,
-        )
-        lock_timeout = finite_positive(
-            os.environ.get("PDF_OCR_LOCK_TIMEOUT_SECONDS", "300"),
-            name="PDF_OCR_LOCK_TIMEOUT_SECONDS",
             maximum=3600,
         )
     except ValueError as exc:
@@ -151,28 +146,20 @@ def extract_pdf_ocr(pdf_path: Path, output_dir: Path) -> str:
             "PDF_OCR_MAX_CPU_SECONDS", "3600"
         ),
     }
-    lock_path = os.environ.get("PDF_OCR_LOCK_PATH", "/tmp/grimoire-pdf-ocr.lock")
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        _acquire_ocr_lock(lock, lock_timeout)
-        try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "api.services.pdf_ocr_worker",
-                    str(pdf_path),
-                    str(output_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                env=env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise DocumentProcessingError(
-                f"PDF OCR timed out after {timeout} seconds"
-            ) from exc
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "api.services.pdf_ocr_worker",
+            str(pdf_path),
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=env,
+    )
     if result.returncode == TERMINAL_DOCUMENT_EXIT_CODE:
         raise DocumentParseError(result.stderr.strip() or "Invalid PDF document")
     if result.returncode != 0:
@@ -186,6 +173,22 @@ def extract_pdf_ocr(pdf_path: Path, output_dir: Path) -> str:
     except OSError as exc:
         raise DocumentProcessingError("Invalid PDF OCR artifact") from exc
     return payload.decode("utf-8", errors="replace").strip()
+
+
+# Keep lock helpers for compatibility, but no longer used for the global OCR gate.
+def _acquire_ocr_lock(lock: object, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DocumentProcessingError(
+                    f"PDF OCR lock acquisition timed out after {timeout_seconds:g} seconds"
+                ) from None
+            time.sleep(min(0.1, remaining))
 
 
 def _build_marker_wrapper(marker_src: Path, pdf_path: Path, output_dir: Path) -> str:
