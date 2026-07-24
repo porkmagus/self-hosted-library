@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import type { IngestProgress } from "../types"
 import { C } from "../types"
 import { api } from "../lib/api"
-import { ingestProgressLabel } from "../lib/ingestPresentation"
+import { ingestProgressLabel, ingestStatusLabel } from "../lib/ingestPresentation"
 import { ErrorBanner, Skeleton, Spinner } from "../components"
 
 interface ActiveBook {
@@ -36,7 +36,18 @@ export function IngestPage() {
     setLoadingStatus(true)
     try {
       const data = await api.ingestStatus()
-      setProgress(data)
+      if (data.status === "idle") {
+        // No active ingestion: clear stale task UI so the page shows "no job".
+        setProgress(null)
+        setStatus("No job currently ingesting")
+        setActiveBooks([])
+        setFailedBooks([])
+      } else {
+        setProgress(data)
+        setStatus(ingestStatusLabel(data.status, data.failed))
+        setActiveBooks([])
+        setFailedBooks([])
+      }
     } catch (e) {
       console.error(e)
     } finally {
@@ -148,7 +159,7 @@ export function IngestPage() {
               background: `${C.gold}18`, color: C.gold, borderRadius: 999,
               border: `1px solid ${C.gold}40`, marginLeft: 8, verticalAlign: "middle",
             }}>
-              {(progress.status || "unknown").toUpperCase()}
+              {ingestStatusLabel(progress.status, progress.failed)}
             </span>
           </div>
           {pct !== null && (

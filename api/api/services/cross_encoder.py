@@ -1,4 +1,4 @@
-"""Cross-encoder re-ranking service."""
+"""Cross-encoder re-ranking service using Mixedbread mxbai-rerank-base-v2."""
 
 from __future__ import annotations
 
@@ -12,22 +12,49 @@ logger = logging.getLogger(__name__)
 _MODEL_PATH = "/app/models/cross-encoder"
 _model: Any | None = None
 
-# Suppress tqdm progress bars from sentence-transformers
+# Suppress tqdm progress bars
 os.environ.setdefault("TQDM_DISABLE", "1")
 
 
 @lru_cache(maxsize=1)
 def get_cross_encoder() -> Any | None:
-    """Load cross-encoder from local model files."""
+    """Load mxbai-rerank-base-v2 from local model files."""
     global _model
     if _model is not None:
         return _model
 
     try:
-        from sentence_transformers import CrossEncoder
+        from mxbai_rerank import MxbaiRerankV2
+        from transformers import PreTrainedTokenizerBase
 
-        logger.info("Loading cross-encoder from local path: %s", _MODEL_PATH)
-        _model = CrossEncoder(_MODEL_PATH, max_length=512)
+        logger.info("Loading mxbai-rerank-base-v2 from local path: %s", _MODEL_PATH)
+        _model = MxbaiRerankV2(_MODEL_PATH, max_length=8192)
+
+        # Transformers 5.x removed prepare_for_model from Qwen2Tokenizer.
+        # Monkey-patch a shim so mxbai-rerank v0.1.6 continues to work.
+        if not hasattr(_model.tokenizer, "prepare_for_model"):
+            def _prepare_for_model_shim(
+                self,
+                ids,
+                pair_ids=None,
+                truncation="only_second",
+                max_length=None,
+                padding=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+                add_special_tokens=False,
+            ):
+                combined = list(ids)
+                if pair_ids is not None:
+                    combined = list(ids) + list(pair_ids)
+                if max_length is not None and max_length > 0:
+                    combined = combined[:max_length]
+                return {"input_ids": combined}
+
+            _model.tokenizer.prepare_for_model = _prepare_for_model_shim.__get__(
+                _model.tokenizer, type(_model.tokenizer)
+            )
+
         logger.info("Cross-encoder loaded successfully")
         return _model
     except Exception as e:
@@ -42,7 +69,7 @@ def rerank_results(
     top_k: int = 20,
     max_candidates: int = 50,
 ) -> list[dict[str, Any]]:
-    """Re-rank search results using cross-encoder scoring."""
+    """Re-rank search results using mxbai-rerank-base-v2 scoring."""
     if not results or not query.strip():
         return results
 
@@ -54,19 +81,18 @@ def rerank_results(
     if not candidates:
         return []
 
-    pairs = [[query, r.get("text", "")] for r in candidates]
+    documents = [r.get("text", "") for r in candidates]
 
     try:
-        import numpy as np
-
-        logits = model.predict(pairs)
-        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
-
-        for i, prob in enumerate(probs):
-            candidates[i]["score"] = round(float(prob), 4)
-
-        candidates.sort(key=lambda r: float(r["score"]), reverse=True)
-        return candidates[:top_k]
+        ranked = model.rank(query=query, documents=documents, top_k=top_k)
+        # ranked is a list of RankResult dataclasses (.index, .score, .document)
+        ordered: list[dict[str, Any]] = []
+        for item in ranked:
+            idx = item.index
+            if idx < len(candidates):
+                candidates[idx]["score"] = round(float(item.score), 4)
+                ordered.append(candidates[idx])
+        return ordered[:top_k]
 
     except Exception as e:
         logger.warning("Cross-encoder scoring failed: %s", e)

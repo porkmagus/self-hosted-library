@@ -33,7 +33,7 @@ RUN apt-get update && \
     && useradd --uid 10001 --gid library --create-home --shell /usr/sbin/nologin library
 
 COPY api/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt mxbai-rerank
 
 COPY --chown=library:library api/ .
 COPY --chown=library:library --from=web-builder /app/web/dist /app/static

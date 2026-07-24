@@ -171,7 +171,7 @@ services:
 
   worker:
     <<: *app-image
-    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=${WORKER_CONCURRENCY:-2}", "--pool=prefork", "--queues=ingestion"]
+    command: ["celery", "-A", "api.tasks.celery_app", "worker", "--loglevel=info", "--autoscale=${WORKER_AUTOSCALE_MAX:-8},1", "--pool=prefork", "--queues=ingestion"]
     environment:
       <<: *api-env
       EMBEDDING_SERVER_URL: "http://embedding_server:8001"

@@ -12,8 +12,9 @@ from typing import Any
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.config import settings as app_settings
 from api.models import get_engine, init_db
@@ -152,6 +153,25 @@ app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+
+class StaticCacheControlMiddleware(BaseHTTPMiddleware):
+    """Disable caching for the SPA entry point and hashed assets.
+
+    Browsers aggressively cache index.html, which pins the old hashed JS/CSS
+    filenames even after a deployment. The app container rebuilds the web bundle
+    on every image build; therefore the server must tell clients to revalidate.
+    """
+
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.endswith(".html") or "/assets/" in path:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+
 if STATIC_DIR.is_dir():
     app.mount(
         "/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets"
@@ -164,3 +184,5 @@ if STATIC_DIR.is_dir():
         if path.is_file():
             return FileResponse(path)
         return FileResponse(STATIC_DIR / "index.html")
+
+    app.add_middleware(StaticCacheControlMiddleware)

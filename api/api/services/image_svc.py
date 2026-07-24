@@ -212,6 +212,37 @@ def normalize_image_bytes(
     return output.getvalue(), "png"
 
 
+def is_blank_image(image: Image.Image, threshold: float = 0.995) -> bool:
+    """Return True if most pixels are near-white/transparent.
+
+    Scanned PDFs often contain embedded raster page images that are completely
+    blank (white paper, no content). These extract as valid PNGs but carry no
+    useful visual information and pollute image search. Skipping them at extract
+    time avoids indexing useless vectors.
+    """
+    if image.mode in {"RGBA", "LA", "P"}:
+        image = image.convert("RGBA")
+        pixels = image.getdata()
+        total = len(pixels)
+        if total == 0:
+            return True
+        blank = sum(
+            1
+            for r, g, b, a in pixels
+            if a < 16 or (r > 250 and g > 250 and b > 250)
+        )
+    else:
+        gray = image.convert("L")
+        hist = gray.histogram()
+        total = sum(hist)
+        if total == 0:
+            return True
+        # Count pixels brighter than 250 (near-white)
+        near_white = sum(hist[251:])
+        blank = near_white
+    return blank / total >= threshold
+
+
 def _extract_images_in_process(
     pdf_path: str,
     book_id: str,
@@ -237,7 +268,7 @@ def _extract_images_in_process(
     max_image_pixels = positive_env("PDF_IMAGE_MAX_PIXELS", 25_000_000)
     document = fitz.open(pdf_path)
     extracted: list[dict[str, Any]] = []
-    total_references = skipped_corrupt = skipped_full_page = skipped_tiny = 0
+    total_references = skipped_corrupt = skipped_full_page = skipped_tiny = skipped_blank = 0
     output_bytes = full_page_kept = 0
     try:
         validate_document(
@@ -307,6 +338,17 @@ def _extract_images_in_process(
                         exc,
                     )
                     continue
+                # Drop blank/white page images that carry no useful content.
+                with Image.open(io.BytesIO(image_bytes)) as check_image:
+                    if is_blank_image(check_image):
+                        skipped_blank += 1
+                        logger.debug(
+                            "Skipping blank PDF image index=%s page=%s in %s",
+                            img_idx,
+                            page_num,
+                            pdf_path,
+                        )
+                        continue
                 output_bytes += len(image_bytes)
                 if output_bytes > max_output_bytes:
                     raise DocumentLimitError("PDF image cumulative output limit exceeded")
@@ -332,16 +374,17 @@ def _extract_images_in_process(
                 )
                 if is_full_page:
                     full_page_kept += 1
-        if skipped_corrupt or skipped_full_page or skipped_tiny:
+        if skipped_corrupt or skipped_full_page or skipped_tiny or skipped_blank:
             logger.warning(
                 "PDF image extraction partial for %s: total=%s extracted=%s "
-                "skipped_corrupt=%s skipped_full_page=%s skipped_tiny=%s",
+                "skipped_corrupt=%s skipped_full_page=%s skipped_tiny=%s skipped_blank=%s",
                 pdf_path,
                 total_references,
                 len(extracted),
                 skipped_corrupt,
                 skipped_full_page,
                 skipped_tiny,
+                skipped_blank,
             )
         return extracted
     finally:

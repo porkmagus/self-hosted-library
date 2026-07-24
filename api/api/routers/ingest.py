@@ -28,14 +28,6 @@ def _summarize_counts(counts: Mapping[str, int], qdrant_chunks: int) -> dict[str
     failed = counts.get("failed", 0)
     in_progress = total - indexed - failed
     progress_pct = round(indexed / total * 100, 1) if total else 0.0
-    if total == 0:
-        status = "idle"
-    elif in_progress:
-        status = "processing"
-    elif failed:
-        status = "completed_with_errors"
-    else:
-        status = "completed"
     return {
         "total_books": total,
         "indexed": indexed,
@@ -43,8 +35,43 @@ def _summarize_counts(counts: Mapping[str, int], qdrant_chunks: int) -> dict[str
         "failed": failed,
         "progress_pct": progress_pct,
         "qdrant_chunks": qdrant_chunks,
-        "status": status,
     }
+
+
+def _activity_status(db: Any) -> str:
+    """Derive status from current job activity, not all-time book history.
+
+    The books table keeps terminal failures forever (866 stale failures), which
+    previously pinned the status at completed_with_errors even at rest. Status
+    here reflects what the system is doing *now*: in_progress when any job or
+    book is actively moving, otherwise idle. Historical counts stay visible in
+    the stats payload (failed=866) regardless.
+    """
+    active_states = (
+        IngestionState.PENDING,
+        IngestionState.RUNNING,
+        IngestionState.RETRY_WAIT,
+        IngestionState.CANCEL_REQUESTED,
+    )
+    active_jobs = (
+        db.query(func.count(IngestionJob.id))
+        .filter(IngestionJob.state.in_(active_states))
+        .scalar()
+        or 0
+    )
+    if active_jobs:
+        return "in_progress"
+
+    running_books = (
+        db.query(func.count(Book.id))
+        .filter(Book.deleted_at.is_(None), Book.status.notin_([BookStatus.INDEXED, BookStatus.FAILED]))
+        .scalar()
+        or 0
+    )
+    if running_books:
+        return "in_progress"
+
+    return "idle"
 
 
 def _get_progress_snapshot() -> dict[str, Any]:
@@ -56,6 +83,7 @@ def _get_progress_snapshot() -> dict[str, Any]:
             .all()
         )
         counts = {row[0].value if row[0] else "none": row[1] for row in rows}
+        status = _activity_status(db)
 
     try:
         from api.services.qdrant_svc import get_collection_stats
@@ -64,7 +92,9 @@ def _get_progress_snapshot() -> dict[str, Any]:
     except Exception as exc:
         logger.warning("Unable to read Qdrant collection stats: %s", exc)
         chunks = 0
-    return _summarize_counts(counts, chunks)
+    summary = _summarize_counts(counts, chunks)
+    summary["status"] = status
+    return summary
 
 
 @router.get("/ingest/status")

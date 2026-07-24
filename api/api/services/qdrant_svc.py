@@ -13,6 +13,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    HnswConfigDiff,
     IsEmptyCondition,
     MatchAny,
     MatchText,
@@ -217,6 +218,12 @@ def init_collection() -> QdrantClient:
             collection_name=settings.QDRANT_COLLECTION,
             vectors_config=VectorParams(
                 size=settings.EMBED_DIMENSION, distance=Distance.COSINE
+            ),
+            hnsw_config=HnswConfigDiff(
+                m=16,
+                ef_construct=100,
+                max_indexing_threads=2,
+                on_disk=True,
             ),
         )
 

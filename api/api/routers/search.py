@@ -179,18 +179,20 @@ async def _compute(req: SearchRequest, timings: dict[str, float]) -> dict[str, A
     try:
         async with _embed_slots:
             client = _get_embed_client()
+            embed_url = (
+                settings.EMBEDDING_SERVER_URL
+                or f"{settings.OLLAMA_URL}/api/embed"
+            )
             response = await client.post(
-                f"{settings.OLLAMA_URL}/api/embed",
-                json={
-                    "model": settings.EMBED_MODEL,
-                    "input": f"Represent this sentence for searching relevant passages: {query}",
-                },
+                f"{embed_url}/embed",
+                json={"texts": [query]},
             )
             response.raise_for_status()
-            embeddings = response.json().get("embeddings", [])
-            if embeddings:
+            result = response.json()
+            embeddings = result.get("embeddings", [])
+            if embeddings and embeddings[0] is not None:
                 query_vector = list(embeddings[0])
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
         logger.warning(
             "Query embedding failed; using indexed lexical retrieval: %s", exc
         )
