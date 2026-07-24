@@ -105,6 +105,10 @@ export const api = {
       method: "POST",
     }),
 
+  stopIngest: () =>
+    request<{ stopped: boolean; revoked_tasks: number; pending_outbox_removed: number }>("/ingest/stop", {
+      method: "POST",
+    }),
 
   searchHistory: (limit = 10, signal?: AbortSignal) =>
     request<{ history: Array<{ query: string }>; total: number }>(

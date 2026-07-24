@@ -1,13 +1,25 @@
-"""Resource-bounded, page-at-a-time PDF OCR helper."""
+"""Resource-bounded, page-at-a-time PDF OCR helper.
+
+Supports two modes:
+1. Local PyMuPDF/Tesseract OCR (legacy)
+2. Remote GPU OCR server when OCR_SERVER_URL is set
+
+The worker container now delegates actual OCR to the GPU server so CPU workers
+stay lightweight and throughput is not serialized by a global lock.
+"""
 
 from __future__ import annotations
 
+import base64
 import math
 import os
 import resource
 import sys
 from pathlib import Path
 from typing import Any, TextIO
+
+import fitz
+import httpx
 
 from api.services.pdf_limits import TERMINAL_DOCUMENT_EXIT_CODE, DocumentLimitError
 
@@ -68,6 +80,46 @@ def _positive_env(name: str) -> int:
     return value
 
 
+def _ocr_via_server(pdf_path: Path, output_path: Path, dpi: int, max_pages: int) -> int:
+    """Send the PDF to the GPU OCR server and write returned text to output_path."""
+    ocr_url = os.environ["OCR_SERVER_URL"].rstrip("/") + "/ocr/pdf"
+    timeout = _positive_env("PDF_OCR_TIMEOUT_SECONDS")
+    with fitz.open(str(pdf_path)) as doc:
+        if len(doc) > max_pages:
+            raise DocumentLimitError(
+                f"PDF OCR page limit exceeded: {len(doc)} > {max_pages}"
+            )
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    max_input_bytes = _positive_env("PDF_OCR_MAX_INPUT_BYTES")
+    if len(pdf_bytes) > max_input_bytes:
+        raise DocumentLimitError(
+            f"PDF OCR input limit exceeded: {len(pdf_bytes)} > {max_input_bytes} bytes"
+        )
+
+    try:
+        response = httpx.post(
+            ocr_url,
+            files={"file": (pdf_path.name, pdf_bytes, "application/pdf")},
+            data={"dpi": str(dpi), "max_pages": str(max_pages)},
+            timeout=timeout,
+        )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f"OCR server request timed out after {timeout}s") from exc
+    except Exception as exc:
+        raise RuntimeError(f"OCR server request failed: {exc}") from exc
+
+    if response.status_code != 200:
+        raise RuntimeError(f"OCR server returned {response.status_code}: {response.text[:200]}")
+
+    data = response.json()
+    text = data.get("text", "")
+    output_path.write_text(text, encoding="utf-8")
+    return data.get("pages", 0)
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print("usage: pdf_ocr_worker INPUT.pdf OUTPUT.txt", file=sys.stderr)
@@ -94,7 +146,10 @@ def main() -> int:
             f"PDF OCR input limit exceeded: {input_bytes} > {max_input_bytes} bytes"
         )
 
-    import fitz
+    # Prefer remote GPU OCR when available; fall back to local PyMuPDF/Tesseract.
+    if os.environ.get("OCR_SERVER_URL"):
+        _ocr_via_server(source, output, dpi, max_pages)
+        return 0
 
     document = fitz.open(str(source))
     try:
@@ -131,8 +186,6 @@ if __name__ == "__main__":
         print(str(exc), file=sys.stderr)
         raise SystemExit(TERMINAL_DOCUMENT_EXIT_CODE) from exc
     except Exception as exc:
-        import fitz
-
         if isinstance(exc, (fitz.FileDataError, fitz.EmptyFileError)):
             print(str(exc), file=sys.stderr)
             raise SystemExit(TERMINAL_DOCUMENT_EXIT_CODE) from exc

@@ -193,6 +193,16 @@ export const GLOBAL_CSS = `
     color: ${C.goldLight};
   }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-danger {
+    border-color: ${C.danger};
+    background: linear-gradient(180deg, rgba(239,83,80,0.12), rgba(239,83,80,0.04));
+    color: ${C.danger};
+  }
+  .btn-danger:hover:not(:disabled) {
+    background: linear-gradient(180deg, rgba(239,83,80,0.22), rgba(239,83,80,0.08));
+    box-shadow: 0 0 18px rgba(239,83,80,0.25);
+    color: #ff7b7b;
+  }
   .btn-ghost {
     border-color: ${C.border};
     background: transparent;

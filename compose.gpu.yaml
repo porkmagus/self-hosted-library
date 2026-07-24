@@ -10,3 +10,12 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  ocr_server:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

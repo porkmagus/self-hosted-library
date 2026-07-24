@@ -451,6 +451,25 @@ def recover_durable_jobs(limit: int = 100) -> dict[str, int]:
                 .limit(limit)
             ).scalars()
         )
+
+        # Finalize cancellations requested while a worker was running. Once the
+        # lease expires (or was already cleared), the job is done stopping.
+        cancelled_ids = list(
+            session.execute(
+                select(IngestionJob.uuid)
+                .where(
+                    IngestionJob.state == IngestionState.CANCEL_REQUESTED,
+                    or_(
+                        IngestionJob.lease_expires_at.is_(None),
+                        IngestionJob.lease_expires_at < now,
+                    ),
+                )
+                .limit(limit)
+            ).scalars()
+        )
+        for cancel_uuid in cancelled_ids:
+            finalize_cancel(session, cancel_uuid)
+
         for exhausted_uuid in exhausted_ids:
             initial = session.execute(
                 select(IngestionJob).where(IngestionJob.uuid == exhausted_uuid)

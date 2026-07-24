@@ -9,14 +9,15 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
+from sqlalchemy import delete, func, select, update
 
 from api.config import settings
-from api.models import Book, BookStatus, IngestionJob, IngestionState, get_db_session
-from api.services.ingestion_jobs import cancel_job
+from api.models import Book, BookStatus, IngestionJob, IngestionState, IngestionOutbox, OutboxState, get_db_session
+from api.services.ingestion_jobs import cancel_job, finalize_cancel
 from api.services.path_svc import resolve_under
+from api.tasks.celery_app import celery_app
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -377,4 +378,96 @@ def ingest_local_books(
         "task_id": task.id,
         "book_count": len(book_paths),
         "status": "queued",
+    }
+
+
+@router.post("/ingest/stop", status_code=202)
+def stop_ingestion(background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """Cancel all active ingestion jobs and revoke queued Celery tasks.
+
+    Running workers will lose their lease at the next checkpoint and exit.
+    Pending outbox events are removed so the beat scheduler stops republishing.
+    """
+    with get_db_session() as db:
+        now = db.execute(select(func.now())).scalar_one()
+
+        # Mark every active job as cancel-requested and invalidate its lease.
+        active_states = (
+            IngestionState.PENDING,
+            IngestionState.RUNNING,
+            IngestionState.RETRY_WAIT,
+        )
+        db.execute(
+            update(IngestionJob)
+            .execution_options(synchronize_session=False)
+            .where(IngestionJob.state.in_(active_states))
+            .values(
+                state=IngestionState.CANCEL_REQUESTED,
+                claim_epoch=IngestionJob.claim_epoch + 1,
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+                cancel_requested_at=now,
+                heartbeat_at=now,
+            )
+        )
+
+        # Collect published outbox UUIDs (these are also the Celery task IDs) so
+        # we can revoke live Celery tasks.
+        published = list(
+            db.execute(
+                select(IngestionOutbox.uuid)
+                .where(
+                    IngestionOutbox.event_type == "dispatch_ingestion",
+                    IngestionOutbox.state == OutboxState.PUBLISHED,
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # Drop any pending dispatch events; they were never published and would
+        # otherwise keep refilling the queue after the stop.
+        pending_deleted = db.execute(
+            delete(IngestionOutbox)
+            .where(
+                IngestionOutbox.event_type == "dispatch_ingestion",
+                IngestionOutbox.state == OutboxState.PENDING,
+            )
+        ).rowcount
+
+        # Immediately finalize cancellation for jobs that are not currently
+        # running (no worker owns them).
+        db.execute(
+            update(IngestionJob)
+            .execution_options(synchronize_session=False)
+            .where(
+                IngestionJob.state == IngestionState.CANCEL_REQUESTED,
+                IngestionJob.lease_owner.is_(None),
+                IngestionJob.lease_expires_at.is_(None),
+            )
+            .values(
+                state=IngestionState.CANCELLED,
+                finished_at=now,
+                lease_token=None,
+                lease_expires_at=None,
+            )
+        )
+
+        db.commit()
+
+    # Revoke queued Celery tasks in the background so the HTTP call stays fast.
+    def _revoke(task_ids: list[str]) -> None:
+        for task_id in task_ids:
+            try:
+                celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+            except Exception as exc:
+                logger.warning("Failed to revoke task %s: %s", task_id, exc)
+
+    background_tasks.add_task(_revoke, published)
+
+    return {
+        "stopped": True,
+        "revoked_tasks": len(published),
+        "pending_outbox_removed": pending_deleted,
     }

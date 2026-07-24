@@ -119,6 +119,26 @@ export function IngestPage() {
     }
   }
 
+  const stopIngest = async () => {
+    setBusy(true)
+    setError(null)
+    setStatus("Stopping ingestion…")
+    try {
+      const data = await api.stopIngest()
+      if (pollingRef.current) clearInterval(pollingRef.current)
+      if (booksPollRef.current) clearInterval(booksPollRef.current)
+      setBusy(false)
+      setStatus(`Ingestion stopped. Revoked ${data.revoked_tasks} queued tasks, removed ${data.pending_outbox_removed} pending publishes.`)
+      setProgress(null)
+      setActiveBooks([])
+      await loadAggregate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setStatus("Stop failed")
+      setBusy(false)
+    }
+  }
+
   const pct = typeof progress?.progress_pct === "number" ? progress.progress_pct : null
 
   return (
@@ -142,6 +162,15 @@ export function IngestPage() {
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
         <button type="button" className="btn" onClick={() => void startIngest()} disabled={busy}>
           {busy ? "RUNNING…" : "START INGESTION"}
+        </button>
+        <button
+          type="button"
+          className="btn btn-danger"
+          onClick={() => void stopIngest()}
+          disabled={busy || !progress}
+          title="Cancel all active and pending ingestion jobs"
+        >
+          STOP INGEST
         </button>
         <button type="button" className="btn btn-ghost" onClick={() => void loadAggregate()}>
           REFRESH STATUS

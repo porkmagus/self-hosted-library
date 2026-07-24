@@ -28,6 +28,7 @@ torch>=2.13.0
 # PDF / document processing
 pymupdf>=1.28.0
 Pillow>=12.3.0
+easyocr>=1.7.0
 
 # Config
 pydantic>=2.13.4

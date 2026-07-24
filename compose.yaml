@@ -35,8 +35,25 @@ x-api-env: &api-env
   EMBED_BATCH_SIZE: ${EMBED_BATCH_SIZE:-512}
   EMBED_BATCH_DELAY: ${EMBED_BATCH_DELAY:-0.0}
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000}
+  # PDF OCR tunables (shared by app + workers + OCR server)
+  PDF_OCR_DPI: ${PDF_OCR_DPI:-200}
+  PDF_OCR_MAX_INPUT_BYTES: ${PDF_OCR_MAX_INPUT_BYTES:-524288000}
+  PDF_OCR_MAX_PAGES: ${PDF_OCR_MAX_PAGES:-1000}
+  PDF_OCR_MAX_PAGE_PIXELS: ${PDF_OCR_MAX_PAGE_PIXELS:-100000000}
+  PDF_OCR_MAX_OUTPUT_BYTES: ${PDF_OCR_MAX_OUTPUT_BYTES:-104857600}
+  PDF_OCR_MAX_MEMORY_BYTES: ${PDF_OCR_MAX_MEMORY_BYTES:-4294967296}
+  PDF_OCR_MAX_CPU_SECONDS: ${PDF_OCR_MAX_CPU_SECONDS:-900}
+  PDF_OCR_TIMEOUT_SECONDS: ${PDF_OCR_TIMEOUT_SECONDS:-600}
+  # OCR server tunables
+  OCR_USE_GPU: ${OCR_USE_GPU:-false}
+  OCR_CONCURRENCY: ${OCR_CONCURRENCY:-2}
+  # Force single-threaded CPU backends so OCR doesn't starve search workers
+  OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+  MKL_NUM_THREADS: ${MKL_NUM_THREADS:-1}
+  OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
+  NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-1}
+  VECLIB_MAXIMUM_THREADS: ${VECLIB_MAXIMUM_THREADS:-1}
   PYTHONUNBUFFERED: "1"
-  PYTHONDONTWRITEBYTECODE: "1"
 
 x-app-image: &app-image
   image: ghcr.io/porkmagus/self-hosted-library:${APP_VERSION:-v1.0.0}
@@ -134,14 +151,31 @@ services:
       retries: 15
       start_period: 30s
 
+  ocr_server:
+    <<: *app-image
+    command: ["uvicorn", "api.services.ocr_server:app", "--host", "0.0.0.0", "--port", "8002", "--workers", "1"]
+    environment:
+      <<: *api-env
+      OCR_SERVER_URL: "http://localhost:8002"
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
   embedding_server:
     <<: *app-image
     command: ["uvicorn", "api.services.embedding_server:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
     environment:
       <<: *api-env
       EMBEDDING_SERVER_URL: "http://localhost:8001"
+      OCR_SERVER_URL: "http://ocr_server:8002"
     depends_on:
       postgres: {condition: service_healthy}
+      ocr_server: {condition: service_healthy}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/health || exit 1"]
       interval: 15s
@@ -175,12 +209,14 @@ services:
     environment:
       <<: *api-env
       EMBEDDING_SERVER_URL: "http://embedding_server:8001"
+      OCR_SERVER_URL: "http://ocr_server:8002"
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       qdrant: {condition: service_healthy}
       seaweedfs: {condition: service_healthy}
       embedding_server: {condition: service_healthy}
+      ocr_server: {condition: service_healthy}
     healthcheck:
       test: ["CMD-SHELL", "celery -A api.tasks.celery_app inspect ping -d celery@$$HOSTNAME 2>/dev/null | grep -q pong"]
       interval: 30s

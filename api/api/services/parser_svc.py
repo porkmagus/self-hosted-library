@@ -145,6 +145,7 @@ def extract_pdf_ocr(pdf_path: Path, output_dir: Path) -> str:
         "PDF_OCR_MAX_CPU_SECONDS": os.environ.get(
             "PDF_OCR_MAX_CPU_SECONDS", "3600"
         ),
+        "OCR_SERVER_URL": os.environ.get("OCR_SERVER_URL", ""),
     }
     result = subprocess.run(
         [

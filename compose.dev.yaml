@@ -42,3 +42,9 @@ services:
       context: .
       dockerfile: Dockerfile
     image: self-hosted-library:dev
+
+  ocr_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: self-hosted-library:dev
