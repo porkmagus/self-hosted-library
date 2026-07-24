@@ -2,6 +2,8 @@ from pathlib import Path
 
 import yaml
 
+from api.tasks.celery_app import celery_app
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -82,13 +84,50 @@ def test_ingestion_and_lifecycle_workers_do_not_share_job_queue() -> None:
     worker_command = services["worker"]["command"]
     lifecycle_command = services["worker_high"]["command"]
 
-    assert "--queues=ingestion,celery" in worker_command
+    assert "--queues=ingestion" in worker_command
+    assert "--queues=ingestion,celery" not in worker_command
     assert "--queues=high" in lifecycle_command
     assert "--queues=high,celery" not in worker_command
 
     celery_source = (ROOT / "api" / "api" / "tasks" / "celery_app.py").read_text()
     assert '"ingest.job": {"queue": "ingestion"}' in celery_source
     assert '"ingest.activate": {"queue": "high"}' in celery_source
+
+
+def test_registration_tasks_have_a_dedicated_mounted_worker() -> None:
+    services = _compose()["services"]
+    command = services["worker_registration"]["command"]
+
+    assert "--queues=registration" in command
+    assert "--queues=registration,celery" not in command
+    assert "--concurrency=1" in command
+
+    routes = celery_app.conf.task_routes
+    assert routes["ingest.batch"]["queue"] == "registration"
+    assert routes["ingest.file"]["queue"] == "registration"
+
+    registration = services["worker_registration"]
+    assert any(volume.endswith(":/app/data") for volume in registration["volumes"])
+
+
+def test_worker_images_include_document_recovery_tools() -> None:
+    dockerfiles = [
+        (ROOT / "Dockerfile").read_text(),
+        (ROOT / "api" / "Dockerfile").read_text(),
+    ]
+
+    for dockerfile in dockerfiles:
+        assert "antiword" in dockerfile
+        assert "unrtf" in dockerfile
+        assert "tesseract-ocr" in dockerfile
+        assert "tesseract-ocr-eng" in dockerfile
+
+
+def test_lifecycle_recovery_tasks_are_routed_to_the_high_queue() -> None:
+    routes = celery_app.conf.task_routes
+
+    assert routes["ingest.recover"]["queue"] == "high"
+    assert routes["ingest.cleanup_stale_uploads"]["queue"] == "high"
 
 
 def test_example_environment_uses_neutral_s3_names() -> None:

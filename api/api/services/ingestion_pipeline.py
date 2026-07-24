@@ -25,10 +25,13 @@ from api.models import (
     IngestionStage,
     get_db_session,
 )
+from api.services.embedding_client import get_embedding_batch
 from api.services.image_svc import (
+    ImageDocumentError,
     extract_images_from_pdf,
     get_image_embedding,
     index_image,
+    parse_persisted_image_manifest,
 )
 from api.services.ingestion_jobs import (
     JobLease,
@@ -42,16 +45,19 @@ from api.services.ingestion_jobs import (
 )
 from api.services.ingestion_outbox import create_event
 from api.services.object_store import get_object_store
-from api.services.embedding_client import get_embedding_batch
 from api.services.parser_svc import (
+    DocumentParseError,
     chunk_text_semantic,
-    convert_pdf_with_marker,
     extract_docx,
     extract_epub,
+    extract_image_metadata,
+    extract_legacy_doc,
+    extract_pdf_ocr,
     extract_pdf_pymupdf,
     extract_text_file,
 )
 from api.services.qdrant_svc import EmbeddedChunk, upsert_ingestion_chunks
+from api.services.safe_artifacts import read_bounded_regular_file
 
 CHUNKER_VERSION = "semantic-v1-1000-200"
 ARTIFACT_SCHEMA_VERSION = 1
@@ -204,16 +210,31 @@ def _file_hash(path: Path) -> str:
 
 def _extract(path: Path, extension: str, output_dir: Path) -> str:
     if extension == ".pdf":
-        markdown = convert_pdf_with_marker(path, output_dir)
-        return (
-            markdown.read_text(encoding="utf-8")
-            if markdown and markdown.exists()
-            else extract_pdf_pymupdf(path)
-        )
+        try:
+            text = extract_pdf_pymupdf(path)
+        except DocumentParseError as exc:
+            raise InvalidDocumentError(str(exc)) from exc
+        if len(text.strip()) >= 10:
+            return text
+        try:
+            return extract_pdf_ocr(path, output_dir)
+        except DocumentParseError as exc:
+            raise InvalidDocumentError(str(exc)) from exc
     if extension == ".epub":
-        return extract_epub(path)
-    if extension in {".docx", ".doc"}:
-        return extract_docx(path)
+        try:
+            return extract_epub(path)
+        except DocumentParseError as exc:
+            raise InvalidDocumentError(str(exc)) from exc
+    if extension == ".docx":
+        try:
+            return extract_docx(path)
+        except DocumentParseError as exc:
+            raise InvalidDocumentError(str(exc)) from exc
+    if extension == ".doc":
+        try:
+            return extract_legacy_doc(path)
+        except DocumentParseError as exc:
+            raise InvalidDocumentError(str(exc)) from exc
     if extension in {".txt", ".md", ".htm", ".html"}:
         return extract_text_file(path)
     # Standalone images - extract metadata as text for search
@@ -302,7 +323,8 @@ def _upload_verified(
     payload: bytes,
     content_type: str,
 ) -> None:
-    if not store.exists(object_key):
+    exists = store.exists(object_key)
+    if not exists:
         store.upload_stream(
             object_key,
             io.BytesIO(payload),
@@ -311,6 +333,15 @@ def _upload_verified(
         )
     if int(store.stat(object_key).size) != len(payload):
         raise OSError(f"Artifact HEAD verification failed for {object_key}")
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="grimoire-verify-object-") as temp:
+        _read_verified_artifact(
+            store,
+            object_key,
+            expected_sha256,
+            Path(temp) / "artifact",
+            max_bytes=len(payload),
+        )
 
 
 def _read_verified_artifact(
@@ -318,9 +349,11 @@ def _read_verified_artifact(
     key: str,
     expected_sha256: str,
     destination: Path,
+    *,
+    max_bytes: int,
 ) -> bytes:
     store.download_to(key, destination)
-    payload = destination.read_bytes()
+    payload = read_bounded_regular_file(destination, max_bytes=max_bytes)
     actual = hashlib.sha256(payload).hexdigest()
     if actual != expected_sha256:
         raise OSError(f"Artifact checksum mismatch for {key}")
@@ -426,11 +459,15 @@ def _build_image_manifest(
     )
 
 
-def _parse_image_manifest(payload: bytes) -> list[dict[str, Any]]:
-    document = json.loads(payload)
-    if document.get("schema_version") != ARTIFACT_SCHEMA_VERSION:
-        raise InvalidDocumentError("Unsupported image manifest schema")
-    return [dict(value) for value in document.get("images", [])]
+def _parse_image_manifest(
+    payload: bytes, *, book_uuid: str, generation: int
+) -> list[dict[str, Any]]:
+    try:
+        return parse_persisted_image_manifest(
+            payload, book_id=book_uuid, generation=generation
+        )
+    except ValueError as exc:
+        raise InvalidDocumentError("Invalid persisted image manifest") from exc
 
 
 def _set_stage(
@@ -622,6 +659,7 @@ def run_ingestion_pipeline(
                     snapshot.extracted_text_key,
                     snapshot.extracted_text_sha256,
                     text_path,
+                    max_bytes=67_108_864,
                 )
                 text_content = text_bytes.decode("utf-8")
             else:
@@ -634,7 +672,14 @@ def run_ingestion_pipeline(
                 ).strip()
                 watchdog.check()
                 if len(text_content) < 10:
-                    raise InvalidDocumentError("Extraction produced insufficient text")
+                    if snapshot.extension != ".pdf":
+                        raise InvalidDocumentError(
+                            "Extraction produced insufficient text"
+                        )
+                    # A scanned/image-only PDF may legitimately produce little
+                    # or no OCR text. Commit a canonical empty text identity;
+                    # the image stage must still find at least one usable image.
+                    text_content = ""
                 text_bytes = text_content.encode("utf-8")
                 text_sha = hashlib.sha256(text_bytes).hexdigest()
                 text_key = f"jobs/{job_uuid}/g{lease.generation}/extracted-{text_sha}.txt"
@@ -659,6 +704,7 @@ def run_ingestion_pipeline(
                     snapshot.chunk_manifest_key,
                     snapshot.chunk_manifest_sha256,
                     manifest_path,
+                    max_bytes=67_108_864,
                 )
                 chunks, fragments = _parse_manifest(manifest_bytes)
                 manifest_sha = snapshot.chunk_manifest_sha256
@@ -667,8 +713,9 @@ def run_ingestion_pipeline(
                     raise InvalidDocumentError(
                         "Chunk manifest missing after stage advancement"
                     )
-                chunks = deps.chunk(text_content)
-                if not chunks:
+                chunks = deps.chunk(text_content) if text_content else []
+                allow_empty_pdf = snapshot.extension == ".pdf" and not text_content
+                if not chunks and not allow_empty_pdf:
                     raise InvalidDocumentError("Chunking produced no canonical chunks")
                 manifest_bytes, fragments = _build_manifest(chunks)
                 manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
@@ -763,8 +810,13 @@ def run_ingestion_pipeline(
                 snapshot.image_manifest_key,
                 snapshot.image_manifest_sha256,
                 image_manifest_path,
+                max_bytes=4_000_000,
             )
-            image_entries = _parse_image_manifest(image_manifest_bytes)
+            image_entries = _parse_image_manifest(
+                image_manifest_bytes,
+                book_uuid=snapshot.book_uuid,
+                generation=lease.generation,
+            )
             image_manifest_sha = snapshot.image_manifest_sha256
         else:
             if snapshot.stage != IngestionStage.EMBEDDING:
@@ -776,13 +828,25 @@ def run_ingestion_pipeline(
             
             # Extract images from PDFs
             if snapshot.extension == ".pdf":
-                extracted_images = deps.extract_images(
-                    str(source_path), snapshot.book_uuid, snapshot.book_title
+                try:
+                    extracted_images = deps.extract_images(
+                        str(source_path),
+                        snapshot.book_uuid,
+                        snapshot.book_title,
+                        not chunks,
+                    )
+                except ImageDocumentError as exc:
+                    raise InvalidDocumentError(str(exc)) from exc
+
+            if not chunks and not extracted_images:
+                raise InvalidDocumentError(
+                    "Document produced neither searchable text nor images"
                 )
             
             # Handle standalone images - they become searchable images
             if snapshot.extension in standalone_image_exts:
                 import uuid as uuid_module
+
                 from PIL import Image as PIL_Image
                 watchdog.check()
                 with source_path.open("rb") as f:
@@ -857,6 +921,7 @@ def run_ingestion_pipeline(
                 str(entry["object_key"]),
                 str(entry["image_sha256"]),
                 image_path,
+                max_bytes=16_777_216,
             )
             vector = deps.embed_image(image_bytes)
             watchdog.check()

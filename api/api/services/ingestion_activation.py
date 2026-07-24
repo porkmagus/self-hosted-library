@@ -13,12 +13,17 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from api.models import Book, BookStatus, IngestionJob, IngestionState
-from api.services.image_svc import activate_image_generation, build_image_point_id
+from api.services.image_svc import (
+    activate_image_generation,
+    build_image_point_id,
+    parse_persisted_image_manifest,
+)
 from api.services.object_store import get_object_store
 from api.services.qdrant_svc import (
     activate_generation,
     build_chunk_point_id,
 )
+from api.services.safe_artifacts import read_bounded_regular_file
 
 
 class ActivationRejected(RuntimeError):
@@ -62,11 +67,13 @@ def derive_expected_vector_points(
     if hashlib.sha256(image_manifest).hexdigest() != job.image_manifest_sha256:
         raise ActivationRejected("Image manifest checksum mismatch")
     text_document = json.loads(text_manifest)
-    image_document = json.loads(image_manifest)
-    if (
-        text_document.get("schema_version") != 1
-        or image_document.get("schema_version") != 1
-    ):
+    try:
+        images = parse_persisted_image_manifest(
+            image_manifest, book_id=book_uuid, generation=job.generation
+        )
+    except ValueError as exc:
+        raise ActivationRejected("Invalid image manifest") from exc
+    if text_document.get("schema_version") != 1:
         raise ActivationRejected("Unsupported vector manifest schema")
     text_claims = list(job.text_batch_claims or [])
     image_claims = list(job.image_batch_claims or [])
@@ -112,7 +119,7 @@ def derive_expected_vector_points(
         )
 
     image_points: list[dict[str, Any]] = []
-    images = list(image_document.get("images", []))
+
     if len(images) != job.total_images or len(
         {str(image["image_id"]) for image in images}
     ) != len(images):
@@ -153,12 +160,12 @@ def derive_expected_vector_points(
     return text_points, image_points
 
 
-def _read_artifact(key: str) -> bytes:
+def _read_artifact(key: str, *, max_bytes: int) -> bytes:
     store = get_object_store()
     with tempfile.TemporaryDirectory(prefix="activation-") as directory:
         destination = Path(directory) / "artifact"
         store.download_to(key, destination)
-        return destination.read_bytes()
+        return read_bounded_regular_file(destination, max_bytes=max_bytes)
 
 
 def _resolve_job_points(
@@ -169,8 +176,8 @@ def _resolve_job_points(
     return derive_expected_vector_points(
         job,
         book_uuid,
-        _read_artifact(job.chunk_manifest_key),
-        _read_artifact(job.image_manifest_key),
+        _read_artifact(job.chunk_manifest_key, max_bytes=67_108_864),
+        _read_artifact(job.image_manifest_key, max_bytes=4_000_000),
     )
 
 

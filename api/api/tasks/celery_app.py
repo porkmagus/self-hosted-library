@@ -22,7 +22,10 @@ from api.models import (
     get_db_session,
 )
 from api.services.image_svc import retire_other_image_activations
-from api.services.ingestion_activation import reconcile_generation_activation
+from api.services.ingestion_activation import (
+    ActivationRejected,
+    reconcile_generation_activation,
+)
 from api.services.ingestion_cleanup import (
     cleanup_deleted_book,
     cleanup_stale_upload_reservations,
@@ -39,6 +42,7 @@ from api.services.ingestion_outbox import (
     create_dispatch_event,
     mark_publish_failed,
     mark_published,
+    reopen_lifecycle_event,
 )
 from api.services.ingestion_pipeline import InvalidDocumentError, run_ingestion_pipeline
 from api.services.ingestion_recovery import recover_reconciliation_events
@@ -71,15 +75,20 @@ def make_celery() -> Celery:
         task_reject_on_worker_lost=True,
         task_queues={
             "celery": {"routing_key": "celery"},
+            "registration": {"routing_key": "registration"},
             "ingestion": {"routing_key": "ingestion"},
             "high": {"routing_key": "high"},
         },
         task_default_queue="celery",
         task_default_routing_key="celery",
         task_routes = {
+            "ingest.batch": {"queue": "registration"},
+            "ingest.file": {"queue": "registration"},
             "ingest.activate": {"queue": "high"},
             "ingest.cleanup_book": {"queue": "high"},
             "ingest.dispatch_outbox": {"queue": "high"},
+            "ingest.recover": {"queue": "high"},
+            "ingest.cleanup_stale_uploads": {"queue": "high"},
             "ingest.job": {"queue": "ingestion"},
         },
         broker_transport_options={"visibility_timeout": 12 * 60 * 60},
@@ -140,17 +149,18 @@ def _transition_failure(
     *,
     terminal: bool,
     error_code: str,
-) -> bool:
+) -> tuple[bool, int | None]:
     with get_db_session() as session:
         job = session.execute(
             select(IngestionJob).where(IngestionJob.uuid == job_uuid)
         ).scalar_one_or_none()
         if job is None:
-            return False
+            return False, None
         lease = _owned_lease(job, owner)
         if lease is None:
-            return False
+            return False, None
         try:
+            retry_delay: int | None = None
             if terminal or job.attempt_count >= job.max_attempts:
                 fail_job(
                     session,
@@ -166,19 +176,36 @@ def _transition_failure(
             else:
                 now = session.execute(select(func.now())).scalar_one()
                 retries = max(0, job.attempt_count - 1)
+                retry_delay = min(300, 5 * (2**retries))
+                retry_at = now + timedelta(seconds=retry_delay)
                 release_for_retry(
                     session,
                     lease,
                     error_code=error_code,
                     error_message=str(exc),
                     error_class=type(exc).__name__,
-                    retry_at=now + timedelta(seconds=min(300, 5 * (2**retries))),
+                    retry_at=retry_at,
                 )
+                event = session.execute(
+                    select(IngestionOutbox).where(
+                        IngestionOutbox.job_uuid == job.uuid,
+                        IngestionOutbox.event_type == "dispatch_ingestion",
+                    )
+                ).scalar_one_or_none()
+                if event is None:
+                    event = create_dispatch_event(session, job.uuid)
+                event.state = OutboxState.PENDING
+                event.available_at = retry_at
+                event.claimed_at = None
+                event.published_at = None
+                event.last_recovered_claim_epoch = None
+                event.last_error = None
+                job.celery_task_id = None
             session.commit()
-            return True
+            return True, retry_delay
         except StaleLease:
             session.rollback()
-            return False
+            return False, None
 
 
 @celery_app.task(bind=True, name="ingest.job", max_retries=MAX_INGEST_RETRIES)
@@ -201,7 +228,7 @@ def ingest_job_task(self: Any, job_uuid: str) -> dict[str, Any]:
         return {"job_uuid": job_uuid, "status": "failed", "error": str(exc)}
     except Exception as exc:
         logger.exception("Transient ingestion failure for %s", job_uuid)
-        transitioned = _transition_failure(
+        transitioned, retry_delay = _transition_failure(
             job_uuid,
             owner,
             exc,
@@ -210,13 +237,22 @@ def ingest_job_task(self: Any, job_uuid: str) -> dict[str, Any]:
         )
         if not transitioned:
             return {"job_uuid": job_uuid, "status": "stale_worker"}
-        retries = int(getattr(self.request, "retries", 0))
-        if retries >= MAX_INGEST_RETRIES:
-            raise
-        raise self.retry(exc=exc, countdown=min(300, 5 * (2**retries))) from exc
+        if retry_delay is None:
+            return {"job_uuid": job_uuid, "status": "failed", "error": str(exc)}
+        return {
+            "job_uuid": job_uuid,
+            "status": "retry_scheduled",
+            "retry_in": retry_delay,
+        }
 
 
-@celery_app.task(bind=True, name="ingest.activate", max_retries=MAX_INGEST_RETRIES)
+@celery_app.task(
+    bind=True,
+    name="ingest.activate",
+    max_retries=0,
+    soft_time_limit=240,
+    time_limit=270,
+)
 def activate_generation_task(self: Any, job_uuid: str) -> dict[str, Any]:
     try:
         with get_db_session() as session:
@@ -239,13 +275,29 @@ def activate_generation_task(self: Any, job_uuid: str) -> dict[str, Any]:
                 book.activation_cleanup_pending = False
             session.commit()
         return result
+    except ActivationRejected:
+        logger.exception("Generation activation rejected for %s", job_uuid)
+        raise
     except Exception as exc:
         logger.exception("Generation activation failed for %s", job_uuid)
-        retries = int(getattr(self.request, "retries", 0))
-        raise self.retry(exc=exc, countdown=min(300, 5 * (2**retries))) from exc
+        with get_db_session() as session:
+            reopen_lifecycle_event(
+                session,
+                aggregate_uuid=job_uuid,
+                event_type="activate_generation",
+                error=str(exc),
+            )
+            session.commit()
+        raise
 
 
-@celery_app.task(bind=True, name="ingest.cleanup_book", max_retries=MAX_INGEST_RETRIES)
+@celery_app.task(
+    bind=True,
+    name="ingest.cleanup_book",
+    max_retries=0,
+    soft_time_limit=240,
+    time_limit=270,
+)
 def cleanup_book_task(self: Any, book_uuid: str) -> dict[str, Any]:
     try:
         with get_db_session() as session:
@@ -254,8 +306,15 @@ def cleanup_book_task(self: Any, book_uuid: str) -> dict[str, Any]:
             return result
     except Exception as exc:
         logger.exception("Book cleanup failed for %s", book_uuid)
-        retries = int(getattr(self.request, "retries", 0))
-        raise self.retry(exc=exc, countdown=min(300, 5 * (2**retries))) from exc
+        with get_db_session() as session:
+            reopen_lifecycle_event(
+                session,
+                aggregate_uuid=book_uuid,
+                event_type="cleanup_book",
+                error=str(exc),
+            )
+            session.commit()
+        raise
 
 
 @celery_app.task(name="ingest.cleanup_stale_uploads")
@@ -306,7 +365,7 @@ def ingest_batch_task(self: Any, book_paths: list[str]) -> dict[str, Any]:
     return {"total": total, "status": "all_queued"}
 
 
-@celery_app.task(name="ingest.dispatch_outbox")
+@celery_app.task(name="ingest.dispatch_outbox", time_limit=240)
 def dispatch_outbox(limit: int = 100) -> dict[str, int]:
     """Publish claimed outbox rows; uncertain publishes are safely redelivered."""
     with get_db_session() as session:
@@ -320,17 +379,37 @@ def dispatch_outbox(limit: int = 100) -> dict[str, int]:
             if event.event_type == "dispatch_ingestion":
                 if event.job_uuid is None:
                     raise ValueError("Dispatch event has no job UUID")
-                task_id = str(ingest_job_task.delay(event.job_uuid).id)
+                task_id = str(
+                    ingest_job_task.apply_async(
+                        args=[event.job_uuid], task_id=event.uuid
+                    ).id
+                )
             elif event.event_type == "activate_generation":
                 if event.job_uuid is None:
                     raise ValueError("Activation event has no job UUID")
-                task_id = str(activate_generation_task.delay(event.job_uuid).id)
+                task_id = str(
+                    activate_generation_task.apply_async(
+                        args=[event.job_uuid], task_id=event.uuid
+                    ).id
+                )
             elif event.event_type == "cleanup_book":
-                task_id = str(cleanup_book_task.delay(event.aggregate_uuid).id)
+                task_id = str(
+                    cleanup_book_task.apply_async(
+                        args=[event.aggregate_uuid], task_id=event.uuid
+                    ).id
+                )
             else:
                 raise ValueError(f"Unsupported outbox event: {event.event_type}")
             with get_db_session() as session:
-                mark_published(session, event.uuid, task_id=task_id)
+                if not mark_published(
+                    session,
+                    event.uuid,
+                    publish_claim_token=event.publish_claim_token,
+                    task_id=task_id,
+                ):
+                    raise RuntimeError(
+                        f"Outbox publication ownership changed for {event.uuid}"
+                    )
                 session.commit()
             published += 1
         except Exception as exc:
@@ -339,21 +418,28 @@ def dispatch_outbox(limit: int = 100) -> dict[str, int]:
                 mark_publish_failed(
                     session,
                     event.uuid,
+                    publish_claim_token=event.publish_claim_token,
                     error=str(exc),
                     retry_seconds=10,
                 )
                 session.commit()
             failed += 1
+    if events and failed == len(events):
+        raise RuntimeError(f"All {failed} claimed outbox publications failed")
     return {"published": published, "failed": failed}
 
 
-@celery_app.task(name="ingest.recover")
+@celery_app.task(name="ingest.recover", time_limit=240)
 def recover_durable_jobs(limit: int = 100) -> dict[str, int]:
     """Reset the reusable dispatch event for eligible or expired jobs."""
     reset = 0
     exhausted = 0
     with get_db_session() as session:
+        reconciled = recover_reconciliation_events(session, limit=limit)
         now = session.execute(select(func.now())).scalar_one()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        stale_dispatch_before = now - timedelta(hours=24)
         exhausted_ids = list(
             session.execute(
                 select(IngestionJob.uuid)
@@ -400,8 +486,11 @@ def recover_durable_jobs(limit: int = 100) -> dict[str, int]:
         jobs = list(
             session.execute(
                 select(IngestionJob)
+                .join(Book, Book.id == IngestionJob.book_id)
                 .where(
                     IngestionJob.attempt_count < IngestionJob.max_attempts,
+                    Book.deleted_at.is_(None),
+                    Book.processing_generation == IngestionJob.generation,
                     or_(
                         IngestionJob.state == IngestionState.PENDING,
                         (
@@ -420,6 +509,18 @@ def recover_durable_jobs(limit: int = 100) -> dict[str, int]:
             ).scalars()
         )
         for job in jobs:
+            expired_running = job.state == IngestionState.RUNNING
+            if expired_running:
+                # Transition the expired lease before reopening dispatch. If the
+                # job remains RUNNING until a worker consumes the new message,
+                # every recovery tick republishes the same job again.
+                job.state = IngestionState.PENDING
+                job.celery_task_id = None
+                job.lease_owner = None
+                job.lease_token = None
+                job.lease_expires_at = None
+                job.retry_at = now
+                job.finished_at = None
             event = session.execute(
                 select(IngestionOutbox).where(
                     IngestionOutbox.job_uuid == job.uuid,
@@ -429,12 +530,30 @@ def recover_durable_jobs(limit: int = 100) -> dict[str, int]:
             if event is None:
                 create_dispatch_event(session, job.uuid)
                 reset += 1
-            elif event.state == OutboxState.PUBLISHED:
+            else:
+                published_at = event.published_at
+                if published_at is not None and published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=timezone.utc)
+                stale_unclaimed = (
+                    not expired_running
+                    and published_at is not None
+                    and published_at <= stale_dispatch_before
+                    and event.last_recovered_claim_epoch != job.claim_epoch
+                )
+            if event is not None and event.state == OutboxState.PUBLISHED and (
+                expired_running or stale_unclaimed
+            ):
+                # A published PENDING / RETRY_WAIT job is already represented in
+                # Celery. Republishing it every recovery tick creates an
+                # unbounded duplicate backlog. An expired RUNNING lease is
+                # transitioned to PENDING and receives exactly one fresh delivery.
                 event.state = OutboxState.PENDING
                 event.available_at = now
                 event.claimed_at = None
+                event.published_at = None
                 event.last_error = None
+                event.last_recovered_claim_epoch = job.claim_epoch
+                job.celery_task_id = None
                 reset += 1
-        reset += recover_reconciliation_events(session, limit=max(0, limit - reset))
         session.commit()
-    return {"reset": reset, "exhausted": exhausted}
+    return {"reset": reset, "exhausted": exhausted, "reconciled": reconciled}

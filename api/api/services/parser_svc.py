@@ -6,6 +6,7 @@ conversion. Handles EPUBs, DOCX, and plain text files.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import logging
 import os
@@ -13,11 +14,29 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+import zipfile
 from pathlib import Path
+from typing import Any
 
+from api.services.pdf_limits import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    TERMINAL_DOCUMENT_EXIT_CODE,
+    finite_positive,
+    pdf_limit_environment,
+)
+from api.services.safe_artifacts import read_bounded_regular_file, read_regular_prefix
 from api.services.search_utils import normalize_display_text
 
 logger = logging.getLogger(__name__)
+
+
+class DocumentParseError(ValueError):
+    """The source is readable but cannot produce supported document text."""
+
+
+class DocumentProcessingError(RuntimeError):
+    """The parser runtime or artifact handoff failed and may be retried."""
 
 
 # Filename sanitization
@@ -44,17 +63,129 @@ def compute_file_hash(file_path: Path) -> str:
 
 # PDF Processing
 def extract_pdf_pymupdf(pdf_path: Path) -> str:
-    """Fast extraction using PyMuPDF. Good for text-heavy PDFs without complex layouts."""
-    import fitz
+    """Extract native PDF text in a resource-bounded subprocess."""
+    with tempfile.TemporaryDirectory(prefix="grimoire-pdf-text-") as temp:
+        output = Path(temp) / "extracted.txt"
+        env = {**os.environ, **pdf_limit_environment()}
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "api.services.pdf_text_worker",
+                    str(pdf_path),
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DocumentProcessingError("Native PDF extraction timed out") from exc
+        if result.returncode == TERMINAL_DOCUMENT_EXIT_CODE:
+            raise DocumentParseError(result.stderr.strip() or "Invalid PDF document")
+        if result.returncode != 0 or not output.exists():
+            raise DocumentProcessingError(
+                result.stderr.strip() or "Native PDF extraction failed"
+            )
+        try:
+            payload = read_bounded_regular_file(
+                output, max_bytes=DEFAULT_MAX_OUTPUT_BYTES
+            )
+        except OSError as exc:
+            raise DocumentProcessingError("Invalid native PDF text artifact") from exc
+        return payload.decode("utf-8", errors="replace").strip()
 
-    doc = fitz.open(str(pdf_path))
-    text_parts = []
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        text = page.get_text("text")
-        text_parts.append(text)
-    doc.close()
-    return "\n\n".join(text_parts)
+
+def _acquire_ocr_lock(lock: object, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DocumentProcessingError(
+                    f"PDF OCR lock acquisition timed out after {timeout_seconds:g} seconds"
+                ) from None
+            time.sleep(min(0.1, remaining))
+
+
+def extract_pdf_ocr(pdf_path: Path, output_dir: Path) -> str:
+    """OCR a PDF in an isolated, serialized subprocess."""
+    output_path = output_dir / f"{pdf_path.stem}.ocr.txt"
+    try:
+        timeout = finite_positive(
+            os.environ.get("PDF_OCR_TIMEOUT_SECONDS", "3600"),
+            name="PDF_OCR_TIMEOUT_SECONDS",
+            maximum=3600,
+        )
+        lock_timeout = finite_positive(
+            os.environ.get("PDF_OCR_LOCK_TIMEOUT_SECONDS", "300"),
+            name="PDF_OCR_LOCK_TIMEOUT_SECONDS",
+            maximum=3600,
+        )
+    except ValueError as exc:
+        raise DocumentProcessingError(str(exc)) from exc
+    env = {
+        **os.environ,
+        "OMP_THREAD_LIMIT": "1",
+        "PDF_OCR_DPI": os.environ.get("PDF_OCR_DPI", "150"),
+        "PDF_OCR_MAX_INPUT_BYTES": os.environ.get(
+            "PDF_OCR_MAX_INPUT_BYTES", "536870912"
+        ),
+        "PDF_OCR_MAX_PAGES": os.environ.get("PDF_OCR_MAX_PAGES", "2000"),
+        "PDF_OCR_MAX_PAGE_PIXELS": os.environ.get(
+            "PDF_OCR_MAX_PAGE_PIXELS", "25000000"
+        ),
+        "PDF_OCR_MAX_OUTPUT_BYTES": os.environ.get(
+            "PDF_OCR_MAX_OUTPUT_BYTES", "67108864"
+        ),
+        "PDF_OCR_MAX_MEMORY_BYTES": os.environ.get(
+            "PDF_OCR_MAX_MEMORY_BYTES", "3221225472"
+        ),
+        "PDF_OCR_MAX_CPU_SECONDS": os.environ.get(
+            "PDF_OCR_MAX_CPU_SECONDS", "3600"
+        ),
+    }
+    lock_path = os.environ.get("PDF_OCR_LOCK_PATH", "/tmp/grimoire-pdf-ocr.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        _acquire_ocr_lock(lock, lock_timeout)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "api.services.pdf_ocr_worker",
+                    str(pdf_path),
+                    str(output_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DocumentProcessingError(
+                f"PDF OCR timed out after {timeout} seconds"
+            ) from exc
+    if result.returncode == TERMINAL_DOCUMENT_EXIT_CODE:
+        raise DocumentParseError(result.stderr.strip() or "Invalid PDF document")
+    if result.returncode != 0:
+        raise DocumentProcessingError(result.stderr.strip() or "PDF OCR failed")
+    if not output_path.exists():
+        raise DocumentProcessingError("PDF OCR did not create a text artifact")
+    try:
+        payload = read_bounded_regular_file(
+            output_path, max_bytes=DEFAULT_MAX_OUTPUT_BYTES
+        )
+    except OSError as exc:
+        raise DocumentProcessingError("Invalid PDF OCR artifact") from exc
+    return payload.decode("utf-8", errors="replace").strip()
 
 
 def _build_marker_wrapper(marker_src: Path, pdf_path: Path, output_dir: Path) -> str:
@@ -158,11 +289,15 @@ def convert_pdf_with_marker(pdf_path: Path, output_dir: Path) -> Path | None:
 # Other formats
 def extract_epub(epub_path: Path) -> str:
     """Extract text from EPUB files."""
+    from ebooklib import ITEM_DOCUMENT
     from ebooklib import epub as ebooklib_epub
 
-    book = ebooklib_epub.read_epub(str(epub_path))
+    try:
+        book = ebooklib_epub.read_epub(str(epub_path))
+    except (zipfile.BadZipFile, KeyError, ValueError) as exc:
+        raise DocumentParseError("Invalid EPUB document") from exc
     text_parts = []
-    for item in book.get_items_of_type(ebooklib_epub.EpubHtml):
+    for item in book.get_items_of_type(ITEM_DOCUMENT):
         content = item.get_content().decode("utf-8", errors="replace")
         # Strip HTML tags for clean text
         clean = re.sub(r"<[^>]+>", "", content)
@@ -175,9 +310,62 @@ def extract_epub(epub_path: Path) -> str:
 def extract_docx(docx_path: Path) -> str:
     """Extract text from DOCX files."""
     from docx import Document
+    from docx.opc.exceptions import PackageNotFoundError
 
-    doc = Document(str(docx_path))
+    try:
+        doc = Document(str(docx_path))
+    except (PackageNotFoundError, zipfile.BadZipFile, KeyError, ValueError) as exc:
+        raise DocumentParseError("Invalid DOCX document") from exc
     return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def extract_legacy_doc(doc_path: Path) -> str:
+    """Extract binary Word, mislabeled RTF, or mislabeled plain text."""
+    header = read_regular_prefix(doc_path, max_bytes=16)
+    if header.startswith(bytes.fromhex("d0cf11e0a1b11ae1")):
+        command = ["antiword", "-m", "UTF-8.txt", str(doc_path)]
+    elif header.lstrip().startswith(br"{\rtf"):
+        command = ["unrtf", "--text", "--nopict", str(doc_path)]
+    else:
+        return extract_text_file(doc_path)
+
+    limits = pdf_limit_environment()
+
+    def apply_limits() -> None:
+        import resource
+
+        memory = int(limits["PDF_MAX_MEMORY_BYTES"])
+        cpu = int(limits["PDF_MAX_CPU_SECONDS"])
+        output = int(limits["PDF_MAX_OUTPUT_BYTES"])
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (output, output))
+
+    output_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="legacy-doc-", delete=False) as output:
+            output_path = Path(output.name)
+            result = subprocess.run(
+                command,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+                check=False,
+                preexec_fn=apply_limits,
+            )
+        if result.returncode != 0:
+            raise DocumentParseError("Legacy Word extractor could not read document")
+        payload = read_bounded_regular_file(
+            output_path, max_bytes=int(limits["PDF_MAX_OUTPUT_BYTES"])
+        )
+        return payload.decode("utf-8", errors="replace").strip()
+    except subprocess.TimeoutExpired as exc:
+        raise DocumentProcessingError("Legacy Word extraction timed out") from exc
+    except OSError as exc:
+        raise DocumentProcessingError(f"Legacy Word extraction failed: {exc}") from exc
+    finally:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
 
 
 def extract_text_file(text_path: Path) -> str:
@@ -194,8 +382,7 @@ def extract_text_file(text_path: Path) -> str:
 # Image metadata extraction
 def extract_image_metadata(image_path: Path) -> dict[str, Any]:
     """Extract EXIF/metadata from standalone images for searchable text."""
-    import json
-    from PIL import Image, ExifTags
+    from PIL import ExifTags, Image
 
     result: dict[str, Any] = {}
     try:

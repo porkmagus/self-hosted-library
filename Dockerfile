@@ -20,10 +20,14 @@ WORKDIR /app
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+      antiword \
       curl \
       libgl1 \
       libglib2.0-0 \
       poppler-utils \
+      tesseract-ocr \
+      tesseract-ocr-eng \
+      unrtf \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 library \
     && useradd --uid 10001 --gid library --create-home --shell /usr/sbin/nologin library

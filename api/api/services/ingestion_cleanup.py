@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from datetime import timedelta, timezone
 from typing import Any
@@ -12,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from api.config import settings
 from api.models import Book, BookStatus, IngestionJob, IngestionState
+from api.services.image_svc import parse_persisted_image_manifest
 from api.services.ingestion_jobs import finalize_cancel
 from api.services.object_store import get_object_store
 from api.services.qdrant_svc import get_qdrant_client
@@ -94,6 +94,13 @@ def cleanup_deleted_book(
     book = session.execute(
         select(Book).where(Book.id == book.id).with_for_update()
     ).scalar_one()
+    if book.cleanup_completed_at is not None:
+        return {
+            "book_id": book_uuid,
+            "status": "already_cleaned",
+            "objects_deleted": 0,
+            "vectors_deleted": 0,
+        }
     jobs = list(
         session.execute(
             select(IngestionJob).where(IngestionJob.book_id == book.id)
@@ -117,14 +124,17 @@ def cleanup_deleted_book(
     keys.update(manifest_keys)
     for job in jobs:
         if job.image_manifest_key and object_store.exists(job.image_manifest_key):
-            manifest = json.loads(
-                b"".join(object_store.iter_bytes(job.image_manifest_key))
+            manifest_payload = bytearray()
+            for chunk in object_store.iter_bytes(job.image_manifest_key):
+                manifest_payload.extend(chunk)
+                if len(manifest_payload) > 4_000_000:
+                    raise RuntimeError("Image manifest exceeds cleanup limit")
+            images = parse_persisted_image_manifest(
+                bytes(manifest_payload), book_id=book.uuid, generation=job.generation
             )
-            if manifest.get("schema_version") != 1:
-                raise RuntimeError("Unsupported image manifest during cleanup")
             keys.update(
                 str(image["object_key"])
-                for image in manifest.get("images", [])
+                for image in images
                 if image.get("object_key")
             )
     objects_deleted = 0
@@ -140,6 +150,7 @@ def cleanup_deleted_book(
     for job in jobs:
         if job.state == IngestionState.CANCEL_REQUESTED:
             finalize_cancel(session, job.uuid)
+    book.cleanup_completed_at = session.execute(select(func.now())).scalar_one()
     session.flush()
     return {
         "book_id": book_uuid,

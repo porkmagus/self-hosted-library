@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import IO
 
@@ -30,6 +31,9 @@ class Store:
 
     def stat(self, object_name: str) -> SimpleNamespace:
         return SimpleNamespace(size=len(self.objects[object_name]))
+
+    def download_to(self, object_name: str, destination: Path) -> None:
+        destination.write_bytes(self.objects[object_name])
 
     def delete(self, object_name: str) -> None:
         self.objects.pop(object_name, None)

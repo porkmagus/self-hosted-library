@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from api.models import Book, BookStatus, IngestionJob, IngestionStage, IngestionState
 from api.services.ingestion_outbox import create_dispatch_event
 from api.services.path_svc import validate_filename
+from api.services.safe_artifacts import read_bounded_regular_file
 
 
 class UploadStore(Protocol):
@@ -27,6 +29,8 @@ class UploadStore(Protocol):
     ) -> None: ...
 
     def stat(self, object_name: str) -> Any: ...
+
+    def download_to(self, object_name: str, destination: Path) -> None: ...
 
     def delete(self, object_name: str) -> None: ...
 
@@ -133,6 +137,21 @@ def submit_uploaded_book(
                 raise OSError(
                     f"Object-store HEAD returned {remote.size} bytes, expected {length}"
                 )
+            session.rollback()
+            reservation = session.query(Book).filter_by(uuid=book_uuid).one()
+            if reservation.status != BookStatus.UPLOADING:
+                raise RuntimeError("Upload reservation is no longer accepting uploads")
+            digest = hashing_stream.hexdigest
+            with tempfile.TemporaryDirectory(prefix="grimoire-source-verify-") as temp:
+                destination = Path(temp) / "source"
+                store.download_to(source_key, destination)
+                payload = read_bounded_regular_file(destination, max_bytes=length)
+            if len(payload) != length:
+                raise OSError(
+                    f"Object-store readback returned {len(payload)} bytes, expected {length}"
+                )
+            if hashlib.sha256(payload).hexdigest() != digest:
+                raise OSError("Object-store source checksum mismatch after upload")
         except Exception as exc:
             session.rollback()
             failed = session.query(Book).filter_by(uuid=book_uuid).one()
@@ -140,7 +159,6 @@ def submit_uploaded_book(
             failed.error_message = str(exc)[:4000]
             session.commit()
             raise
-        digest = hashing_stream.hexdigest
     session.rollback()
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         session.execute(

@@ -17,9 +17,43 @@ from api.models import (
     IngestionStage,
     IngestionState,
 )
-from api.services.ingestion_jobs import JobLease, release_for_retry
+from api.services import ingestion_pipeline
 from api.services.ingestion_activation import derive_expected_vector_points
+from api.services.ingestion_jobs import JobLease, release_for_retry
 from api.services.ingestion_pipeline import PipelineDependencies, run_ingestion_pipeline
+
+
+def test_scanned_pdf_extraction_uses_ocr_only_after_native_text_is_empty(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"scan")
+    monkeypatch.setattr(ingestion_pipeline, "extract_pdf_pymupdf", lambda _: "")
+    monkeypatch.setattr(
+        ingestion_pipeline,
+        "extract_pdf_ocr",
+        lambda path, output: "recovered searchable text",
+    )
+
+    assert ingestion_pipeline._extract(source, ".pdf", tmp_path) == (
+        "recovered searchable text"
+    )
+
+
+@pytest.mark.parametrize(("extension", "extractor"), [(".epub", "extract_epub"), (".docx", "extract_docx")])
+def test_malformed_archive_documents_are_terminal(
+    tmp_path: Path, monkeypatch, extension: str, extractor: str
+) -> None:
+    source = tmp_path / f"broken{extension}"
+    source.write_bytes(b"broken")
+
+    def invalid(_path):
+        raise ingestion_pipeline.DocumentParseError("invalid archive document")
+
+    monkeypatch.setattr(ingestion_pipeline, extractor, invalid)
+
+    with pytest.raises(ingestion_pipeline.InvalidDocumentError, match="invalid archive"):
+        ingestion_pipeline._extract(source, extension, tmp_path)
 
 
 class MemoryStore:
@@ -46,6 +80,15 @@ class MemoryStore:
 
     def stat(self, key: str) -> SimpleNamespace:
         return SimpleNamespace(size=len(self.objects[key]))
+
+
+def test_upload_verified_rejects_existing_same_size_wrong_hash() -> None:
+    store = MemoryStore({"artifact": b"wrong"})
+
+    with pytest.raises(OSError, match="checksum mismatch"):
+        ingestion_pipeline._upload_verified(
+            store, "artifact", b"right", "application/octet-stream"
+        )
 
 
 def test_pipeline_resumes_after_last_committed_vector_batch(monkeypatch) -> None:
@@ -197,7 +240,16 @@ def test_pipeline_resumes_after_last_committed_vector_batch(monkeypatch) -> None
         assert activation.event_type == "activate_generation"
 
 
-def test_pdf_pipeline_persists_and_checkpoints_image_manifest(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("extracted_text", "chunks", "expected_chunks"),
+    [
+        ("document text long enough to index", ["document chunk"], 1),
+        ("tiny", [], 0),
+    ],
+)
+def test_pdf_pipeline_persists_and_checkpoints_image_manifest(
+    monkeypatch, extracted_text: str, chunks: list[str], expected_chunks: int
+) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -252,9 +304,9 @@ def test_pdf_pipeline_persists_and_checkpoints_image_manifest(monkeypatch) -> No
     deps = PipelineDependencies(
         sessions=sessions,
         store=store,
-        extract=lambda *_: "document text long enough to index",
-        chunk=lambda _: ["document chunk"],
-        embed_vectors=lambda _: [[0.1, 0.2]],
+        extract=lambda *_: extracted_text,
+        chunk=lambda _: chunks,
+        embed_vectors=lambda values: [[0.1, 0.2] for _ in values],
         upsert=lambda chunks, **_: len(chunks),
         extract_images=lambda *_: [image],
         embed_image=lambda _: [0.3, 0.4],
@@ -273,6 +325,7 @@ def test_pdf_pipeline_persists_and_checkpoints_image_manifest(monkeypatch) -> No
     )
 
     assert result["indexed_images"] == 1
+    assert result["indexed_chunks"] == expected_chunks
     assert indexed_images == ["55555555-5555-5555-5555-555555555555"]
     with factory() as session:
         job = session.query(IngestionJob).one()
@@ -283,6 +336,7 @@ def test_pdf_pipeline_persists_and_checkpoints_image_manifest(monkeypatch) -> No
         assert job.next_image_index == 1
         assert job.indexed_images == 1
         assert job.image_manifest_key in store.objects
+        assert job.chunk_manifest_key in store.objects
         assert book.total_images == 1
         assert book.indexed_images == 1
 

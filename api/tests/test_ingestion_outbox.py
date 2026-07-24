@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -58,12 +60,24 @@ def test_outbox_claim_failure_and_publish_are_durable() -> None:
     assert claimed[0].job_uuid == job_uuid
     assert session.get(IngestionOutbox, event.id).state == OutboxState.PUBLISHING
 
-    assert mark_publish_failed(session, event.uuid, error="redis down", retry_seconds=0)
+    assert mark_publish_failed(
+        session,
+        event.uuid,
+        publish_claim_token=claimed[0].publish_claim_token,
+        error="redis down",
+        retry_seconds=0,
+    )
     session.commit()
-    assert claim_dispatch_events(session)[0].uuid == event.uuid
+    reclaimed = claim_dispatch_events(session)[0]
+    assert reclaimed.uuid == event.uuid
     session.commit()
 
-    assert mark_published(session, event.uuid, task_id="celery-task")
+    assert mark_published(
+        session,
+        event.uuid,
+        publish_claim_token=reclaimed.publish_claim_token,
+        task_id="celery-task",
+    )
     session.commit()
     row = session.get(IngestionOutbox, event.id)
     assert row.state == OutboxState.PUBLISHED
@@ -81,3 +95,55 @@ def test_book_cleanup_event_does_not_require_job_uuid() -> None:
     assert claimed[0].aggregate_type == "book"
     assert claimed[0].aggregate_uuid == book_uuid
     assert event.aggregate_uuid == book_uuid
+
+
+def test_failed_publish_cas_does_not_change_job_task_id() -> None:
+    session, _, job_uuid = _session()
+    event = create_dispatch_event(session, job_uuid)
+    event.state = OutboxState.PUBLISHED
+    job = session.query(IngestionJob).filter_by(uuid=job_uuid).one()
+    job.celery_task_id = "original"
+    session.commit()
+
+    assert not mark_published(
+        session,
+        event.uuid,
+        publish_claim_token="not-the-owner",
+        task_id="incorrect",
+    )
+    session.commit()
+
+    assert session.query(IngestionJob).filter_by(uuid=job_uuid).one().celery_task_id == "original"
+
+
+def test_stale_publisher_cannot_complete_or_fail_reclaimed_event() -> None:
+    session, _, job_uuid = _session()
+    event = create_dispatch_event(session, job_uuid)
+    session.commit()
+    old_claim = claim_dispatch_events(session)[0]
+    row = session.get(IngestionOutbox, event.id)
+    row.claimed_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    session.commit()
+
+    new_claim = claim_dispatch_events(session, stale_after_seconds=1)[0]
+    session.commit()
+    assert new_claim.publish_claim_token != old_claim.publish_claim_token
+    assert not mark_published(
+        session,
+        event.uuid,
+        publish_claim_token=old_claim.publish_claim_token,
+        task_id="stale",
+    )
+    assert not mark_publish_failed(
+        session,
+        event.uuid,
+        publish_claim_token=old_claim.publish_claim_token,
+        error="stale failure",
+        retry_seconds=0,
+    )
+    assert mark_published(
+        session,
+        event.uuid,
+        publish_claim_token=new_claim.publish_claim_token,
+        task_id="current",
+    )

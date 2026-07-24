@@ -143,6 +143,9 @@ class Book(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     row_version: Mapped[int] = mapped_column(
         Integer, default=1, server_default="1", nullable=False
     )
@@ -360,6 +363,11 @@ class IngestionOutbox(Base):
     )
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_recovered_claim_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    publish_claim_token: Mapped[str | None] = mapped_column(String(36))
+    lifecycle_recovery_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

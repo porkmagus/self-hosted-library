@@ -7,11 +7,11 @@ import pytest
 from PIL import Image
 
 from api.services import image_svc
-from api.services.image_svc import extract_images_from_pdf
+from api.services.image_svc import ImageDocumentError, extract_images_from_pdf
 
 
 def _write_pdf_with_image(path: Path) -> None:
-    image = Image.new("RGB", (64, 48), color=(44, 18, 77))
+    image = Image.new("RGB", (64, 64), color=(44, 18, 77))
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
 
@@ -33,7 +33,7 @@ def test_pdf_image_extraction_preserves_metadata_and_bytes(tmp_path: Path) -> No
     assert images[0]["book_title"] == "Illustrated Grimoire"
     assert images[0]["page_number"] == 0
     assert images[0]["width"] == 64
-    assert images[0]["height"] == 48
+    assert images[0]["height"] == 64
     assert images[0]["image_bytes"]
 
 
@@ -67,7 +67,7 @@ def test_corrupt_pdf_image_extraction_is_not_silently_treated_as_empty(
     path = tmp_path / "corrupt.pdf"
     path.write_bytes(b"not a pdf")
 
-    with pytest.raises(fitz.FileDataError):
+    with pytest.raises(ImageDocumentError, match="Failed to open file"):
         extract_images_from_pdf(str(path), "book-1", "Corrupt")
 
 

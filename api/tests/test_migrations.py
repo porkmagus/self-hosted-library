@@ -11,8 +11,8 @@ def test_migration_history_has_one_durable_ingestion_head() -> None:
     config.set_main_option("script_location", str(API_ROOT / "migrations"))
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ["0003"]
-    assert scripts.get_revision("0003").down_revision == "0002"
+    assert scripts.get_heads() == ["0004"]
+    assert scripts.get_revision("0004").down_revision == "0003"
 
 
 def test_durable_ingestion_migration_contains_required_schema_changes() -> None:
@@ -35,3 +35,10 @@ def test_durable_ingestion_migration_contains_required_schema_changes() -> None:
         "uq_ingestion_job_book_generation",
     ):
         assert required in migration
+
+
+def test_delivery_fencing_migration_does_not_assume_published_cleanup_completed() -> None:
+    migration = (API_ROOT / "migrations/versions/0004_delivery_fencing.py").read_text()
+
+    assert "UPDATE books AS b" not in migration
+    assert "o.state = 'published'" not in migration

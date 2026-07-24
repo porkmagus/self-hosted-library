@@ -46,6 +46,9 @@ class RecordingStore:
         self.objects.pop(object_name, None)
         self.deleted.append(object_name)
 
+    def download_to(self, object_name: str, destination) -> None:
+        destination.write_bytes(self.objects[object_name])
+
 
 def _session() -> Session:
     engine = create_engine("sqlite://")
@@ -140,6 +143,27 @@ def test_storage_failure_persists_failed_reservation_without_job() -> None:
     assert book.status == BookStatus.FAILED
     assert session.query(IngestionJob).count() == 0
     assert session.query(IngestionOutbox).count() == 0
+
+
+def test_same_size_corrupt_source_upload_is_rejected_before_acceptance() -> None:
+    session = _session()
+
+    class CorruptingStore(RecordingStore):
+        def download_to(self, object_name: str, destination) -> None:
+            payload = self.objects[object_name]
+            destination.write_bytes(b"x" * len(payload))
+
+    with pytest.raises(OSError, match="checksum"):
+        submit_uploaded_book(
+            session,
+            filename="corrupt.txt",
+            content_type="text/plain",
+            stream=io.BytesIO(b"durable payload"),
+            store=CorruptingStore(),
+        )
+
+    assert session.query(Book).one().status == BookStatus.FAILED
+    assert session.query(IngestionJob).count() == 0
 
 
 def test_submission_cannot_accept_reservation_claimed_by_cleanup() -> None:

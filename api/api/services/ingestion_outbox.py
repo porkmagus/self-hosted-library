@@ -20,6 +20,7 @@ class OutboxEvent:
     aggregate_type: str
     aggregate_uuid: str
     event_type: str
+    publish_claim_token: str
 
 
 def create_event(session: Session, job_uuid: str, event_type: str) -> IngestionOutbox:
@@ -56,6 +57,42 @@ def create_book_event(
     return event
 
 
+def reopen_lifecycle_event(
+    session: Session,
+    *,
+    aggregate_uuid: str,
+    event_type: str,
+    error: str,
+    retry_seconds: int = 30,
+) -> bool:
+    """Atomically make a published lifecycle event eligible after task failure."""
+    now = session.execute(select(func.now())).scalar_one()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    event = session.execute(
+        select(IngestionOutbox)
+        .where(
+            IngestionOutbox.aggregate_uuid == aggregate_uuid,
+            IngestionOutbox.event_type == event_type,
+            IngestionOutbox.state.in_(
+                (OutboxState.PUBLISHED, OutboxState.PUBLISHING)
+            ),
+        )
+        .order_by(IngestionOutbox.id.desc())
+        .limit(1)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if event is None:
+        return False
+    event.state = OutboxState.PENDING
+    event.available_at = now + timedelta(seconds=retry_seconds)
+    event.claimed_at = None
+    event.published_at = None
+    event.publish_claim_token = None
+    event.last_error = error[:4000]
+    return True
+
+
 def claim_dispatch_events(
     session: Session,
     *,
@@ -88,46 +125,61 @@ def claim_dispatch_events(
         .with_for_update(skip_locked=True)
     )
     rows = list(session.execute(query).scalars())
-    events = [
+    for row in rows:
+        row.publish_claim_token = str(uuid4())
+        row.state = OutboxState.PUBLISHING
+        row.claimed_at = now
+        row.attempts += 1
+    session.flush()
+    return [
         OutboxEvent(
             row.uuid,
             row.job_uuid,
             row.aggregate_type,
             row.aggregate_uuid,
             row.event_type,
+            str(row.publish_claim_token),
         )
         for row in rows
     ]
-    for row in rows:
-        row.state = OutboxState.PUBLISHING
-        row.claimed_at = now
-        row.attempts += 1
-    session.flush()
-    return events
 
 
-def mark_published(session: Session, event_uuid: str, *, task_id: str) -> bool:
+def mark_published(
+    session: Session,
+    event_uuid: str,
+    *,
+    publish_claim_token: str,
+    task_id: str,
+) -> bool:
     now = session.execute(select(func.now())).scalar_one()
     result: CursorResult = session.execute(  # type: ignore[assignment,type-arg]
         update(IngestionOutbox)
         .where(
             IngestionOutbox.uuid == event_uuid,
             IngestionOutbox.state == OutboxState.PUBLISHING,
+            IngestionOutbox.publish_claim_token == publish_claim_token,
         )
-        .values(state=OutboxState.PUBLISHED, published_at=now, last_error=None)
+        .values(
+            state=OutboxState.PUBLISHED,
+            published_at=now,
+            publish_claim_token=None,
+            last_error=None,
+        )
     )
-    # Celery task IDs are diagnostic; duplicates are expected after uncertain publish.
-    from api.models import IngestionJob
+    if result.rowcount == 1:
+        # Celery task IDs are diagnostic; duplicates remain safe after an
+        # uncertain broker acknowledgement.
+        from api.models import IngestionJob
 
-    event = session.execute(
-        select(IngestionOutbox).where(IngestionOutbox.uuid == event_uuid)
-    ).scalar_one_or_none()
-    if event is not None and event.job_uuid is not None:
-        session.execute(
-            update(IngestionJob)
-            .where(IngestionJob.uuid == event.job_uuid)
-            .values(celery_task_id=task_id)
-        )
+        event = session.execute(
+            select(IngestionOutbox).where(IngestionOutbox.uuid == event_uuid)
+        ).scalar_one()
+        if event.job_uuid is not None:
+            session.execute(
+                update(IngestionJob)
+                .where(IngestionJob.uuid == event.job_uuid)
+                .values(celery_task_id=task_id)
+            )
     session.flush()
     return result.rowcount == 1
 
@@ -136,6 +188,7 @@ def mark_publish_failed(
     session: Session,
     event_uuid: str,
     *,
+    publish_claim_token: str,
     error: str,
     retry_seconds: int,
 ) -> bool:
@@ -147,11 +200,13 @@ def mark_publish_failed(
         .where(
             IngestionOutbox.uuid == event_uuid,
             IngestionOutbox.state == OutboxState.PUBLISHING,
+            IngestionOutbox.publish_claim_token == publish_claim_token,
         )
         .values(
             state=OutboxState.PENDING,
             available_at=now + timedelta(seconds=retry_seconds),
             claimed_at=None,
+            publish_claim_token=None,
             last_error=error[:4000],
         )
     )

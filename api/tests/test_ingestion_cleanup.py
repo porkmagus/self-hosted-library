@@ -20,11 +20,28 @@ from api.services.ingestion_cleanup import (
 
 class Store:
     def __init__(self) -> None:
-        image_keys = [f"private-image-{index}" for index in range(20)]
+        book_uuid = "11111111-1111-1111-1111-111111111111"
+        image_ids = [f"00000000-0000-0000-0000-{index:012d}" for index in range(20)]
+        image_keys = [
+            f"books/{book_uuid}/generations/1/images/{image_id}.png"
+            for image_id in image_ids
+        ]
+        self.image_keys = image_keys
         image_manifest = json.dumps(
             {
                 "schema_version": 1,
-                "images": [{"object_key": key} for key in image_keys],
+                "images": [
+                    {
+                        "image_id": image_id,
+                        "image_sha256": "a" * 64,
+                        "object_key": key,
+                        "ext": "png",
+                        "page_number": index,
+                        "width": 1,
+                        "height": 1,
+                    }
+                    for index, (image_id, key) in enumerate(zip(image_ids, image_keys, strict=True))
+                ],
             }
         ).encode()
         self.objects = {
@@ -97,8 +114,7 @@ def test_cleanup_is_external_then_finalizes_cancelled_job() -> None:
     assert store.objects == {}
     manifest_index = store.deleted.index("images")
     assert all(
-        store.deleted.index(f"private-image-{index}") < manifest_index
-        for index in range(20)
+        store.deleted.index(key) < manifest_index for key in store.image_keys
     )
     assert vector_calls == [book.uuid]
 

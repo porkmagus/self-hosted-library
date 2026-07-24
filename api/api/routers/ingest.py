@@ -165,6 +165,7 @@ def delete_book(book_id: str) -> dict[str, Any]:
         now = db.query(func.now()).scalar()
         book.processing_generation += 1
         book.deleted_at = now
+        book.cleanup_completed_at = None
         book.status = BookStatus.DELETED
         jobs = db.query(IngestionJob).filter(IngestionJob.book_id == book.id).all()
         for job in jobs:
